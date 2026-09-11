@@ -42,11 +42,15 @@ if [[ "$(uname -m)" != "x86_64" ]]; then
 	exit 1
 fi
 # "random" draws a fresh 16-byte secret so a first install can run unattended.
-# It cannot collide with a real value, since a secret is hex. On a reinstall
-# this rotates the secret and invalidates every client link already handed out,
-# so it is not a substitute for passing the existing one.
+# It cannot collide with a real value, since a secret is hex.
 if [[ "$secret" == random ]]; then
 	secret="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d '[:space:]')"
+elif [[ -z "$secret" ]] && [[ -f /etc/tproxy-server/profiles.json ]]; then
+	# A reinstall keeps the secret this host already serves, as it does the base
+	# path and the promo tag. Rotating it invalidates every client link already
+	# handed out, and the loss is silent: the installer is the only thing that
+	# prints the link, and it prints a different one on every such run.
+	secret="$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/tproxy-server/profiles.json | head -n1)"
 fi
 if [[ -z "$secret" ]]; then
 	read -r -s -p "WEB proxy secret (32 hex, optionally prefixed with dd): " secret
