@@ -12,9 +12,10 @@ static_routes=exact
 mtproxy_workers=1
 mtproxy_max_connections=4096
 mtproxy_tag=
+carrier_mode=
 
 usage() {
-	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex|random] [--mtproxy-workers 1] [--mtproxy-max-connections 4096] [--mtproxy-tag 32-hex]" >&2
+	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex|random] [--mtproxy-workers 1] [--mtproxy-max-connections 4096] [--mtproxy-tag 32-hex] [--carrier-mode https|https-lanes|websocket|websocket-lanes]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -29,6 +30,7 @@ while [[ $# -gt 0 ]]; do
 		--mtproxy-workers) mtproxy_workers="${2:-}"; shift 2 ;;
 		--mtproxy-max-connections) mtproxy_max_connections="${2:-}"; shift 2 ;;
 		--mtproxy-tag) mtproxy_tag="${2:-}"; shift 2 ;;
+		--carrier-mode) carrier_mode="${2:-}"; shift 2 ;;
 		*) usage; exit 2 ;;
 	esac
 done
@@ -74,6 +76,13 @@ elif [[ -z "$base_path" ]]; then
 		base_path="$(head -c 10 /dev/urandom | base32 | tr 'A-Z' 'a-z')"
 	fi
 fi
+# A reinstall keeps whatever carrier mode this host already serves, for the same
+# reason it keeps the secret and the base path: profiles.json is rewritten on
+# every run, so a mode chosen later would otherwise silently revert to the
+# default and swap every client back to the transport it was moved off.
+if [[ -z "$carrier_mode" ]] && [[ -f /etc/tproxy-server/profiles.json ]]; then
+	carrier_mode="$(sed -n 's/.*"carrier_mode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/tproxy-server/profiles.json | head -n1)"
+fi
 if [[ -n "$base_path" ]] && ! [[ "$base_path" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*(/[A-Za-z0-9][A-Za-z0-9_-]*)*$ ]]; then
 	echo "base path segments must match [A-Za-z0-9][A-Za-z0-9_-]* joined by /" >&2
 	usage
@@ -107,6 +116,13 @@ if [[ -n "$mtproxy_tag" ]] && [[ ! "$mtproxy_tag" =~ ^[0-9a-fA-F]{32}$ ]]; then
 	echo "--mtproxy-tag must be the 32 hex digits of the 16-byte tag from @MTProxybot" >&2
 	exit 2
 fi
+case "$carrier_mode" in
+	""|https|https-lanes|websocket|websocket-lanes) ;;
+	*)
+		echo "--carrier-mode must be https, https-lanes, websocket or websocket-lanes" >&2
+		exit 2
+		;;
+esac
 
 repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ "$static_routes" != exact && "$static_routes" != legacy ]]; then
@@ -231,8 +247,15 @@ $public_source
   "profiles_file": "/run/credentials/tproxy-server.service/profiles.json"
 }
 EOF
+# "carrier_mode" is written only when one was chosen. The bridge renderer
+# rejects an empty or unknown mode rather than defaulting, so the key has to be
+# absent - not present and empty - for the https default to apply.
+carrier_mode_field=
+if [[ -n "$carrier_mode" ]]; then
+	carrier_mode_field=",\"carrier_mode\":\"$carrier_mode\""
+fi
 cat > /etc/tproxy-server/profiles.json <<EOF
-{"profiles":[{"name":"default","secret":"$secret","backend":"127.0.0.1:2398"}]}
+{"profiles":[{"name":"default","secret":"$secret","backend":"127.0.0.1:2398"$carrier_mode_field}]}
 EOF
 chown root:tproxy /etc/tproxy-server/config.json /etc/tproxy-server/profiles.json
 chmod 0640 /etc/tproxy-server/config.json
@@ -392,6 +415,9 @@ echo "Installed for https://$hostname/$base_path"
 echo "Internal mtproxy secret: $secret"
 if [[ -n "$mtproxy_tag" ]]; then
 	echo "Promo tag:               $mtproxy_tag"
+fi
+if [[ -n "$carrier_mode" ]]; then
+	echo "Carrier mode:            $carrier_mode"
 fi
 echo "Proxy server:            $client_address"
 echo "Proxy secret:            $proxy_secret"
