@@ -337,7 +337,13 @@ systemctl daemon-reload
 systemctl enable --now tproxy-firewall.service
 systemctl enable --now mtproxy.service
 systemctl restart mtproxy.service
-systemctl enable --now tproxy-server.service
+# The relay reads config.json and its profiles credential once, at startup, and
+# has no reload path. Writing both files above changes nothing for a relay that
+# is already running, and "enable --now" is a no-op on a running unit, so a
+# reinstall would keep serving the first install's host, base path and secret:
+# the link it prints would never work. Restart explicitly, as mtproxy and caddy do.
+systemctl enable tproxy-server.service
+systemctl restart tproxy-server.service
 systemctl enable --now refresh-mtproxy-config.timer
 systemctl enable --now caddy.service
 systemctl restart caddy.service
