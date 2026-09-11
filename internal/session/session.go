@@ -75,6 +75,14 @@ type downBatch struct {
 	items int
 }
 
+type pendingUpBatch struct {
+	frames        []frame.Frame
+	size          int
+	digest        [sha256.Size]byte
+	reservedCost  int
+	reservedItems int
+}
+
 type carrierLane struct {
 	lastUpSequence  uint64
 	lastUpDigest    [sha256.Size]byte
@@ -122,8 +130,11 @@ type Session struct {
 	unackedBase           uint64
 	downCursor            uint64
 	lastUpSequence        uint64
-	lastUpDigest          [sha256.Size]byte
-	upActive              bool
+	upPendingBatches      map[uint64]*pendingUpBatch
+	upAppliedDigests      map[uint64][sha256.Size]byte
+	upAppliedOrder        []uint64
+	upAppliedStart        int
+	upParsing             int
 	downActive            bool
 	superseded            chan struct{}
 	websocketActive       bool
@@ -156,6 +167,8 @@ func newSession(options sessionOptions) *Session {
 		streams:               make(map[uint32]*streamState),
 		closedStreams:         make(map[uint32]struct{}),
 		pendingWindows:        make(map[uint32]int),
+		upPendingBatches:      make(map[uint64]*pendingUpBatch),
+		upAppliedDigests:      make(map[uint64][sha256.Size]byte),
 		lastActivity:          time.Now(),
 		notify:                make(chan struct{}, 1),
 		budgetNotify:          make(chan struct{}),
@@ -245,6 +258,9 @@ func (s *Session) ReleaseWebSocketLane(laneID uint32) {
 	}
 }
 
+// ProcessUp applies one uplink batch. A batch may arrive ahead of the applied
+// watermark, because the client may keep several POSTs in flight; such a batch
+// is parked, acknowledged, and applied once the batches before it have landed.
 func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	if s.usesCarrierLanes() {
 		return 0, ErrProtocol
@@ -256,8 +272,13 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		return 0, ErrClosed
 	}
 	s.lastActivity = time.Now()
-	if sequence == s.lastUpSequence && sequence != 0 {
-		match := bytes.Equal(digest[:], s.lastUpDigest[:])
+	if sequence == 0 || sequence > s.lastUpSequence+uint64(s.limits.MaxPipelinedUpBatches) {
+		s.mu.Unlock()
+		s.protocolFailure()
+		return 0, ErrProtocol
+	}
+	if sequence <= s.lastUpSequence {
+		match := s.replayUpLocked(sequence, digest)
 		s.mu.Unlock()
 		if !match {
 			s.protocolFailure()
@@ -265,16 +286,19 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		}
 		return sequence, nil
 	}
-	if sequence != s.lastUpSequence+1 || sequence == 0 {
+	if parked, ok := s.upPendingBatches[sequence]; ok {
 		s.mu.Unlock()
-		s.protocolFailure()
-		return 0, ErrProtocol
+		if !bytes.Equal(digest[:], parked.digest[:]) {
+			s.protocolFailure()
+			return 0, ErrProtocol
+		}
+		return sequence, nil
 	}
-	if s.upActive {
+	if s.upParsing >= s.limits.MaxPipelinedUpBatches {
 		s.mu.Unlock()
 		return 0, ErrConcurrent
 	}
-	s.upActive = true
+	s.upParsing++
 	s.mu.Unlock()
 
 	frames, err := frame.ParseAll(body, s.limits.MaxFramePayload)
@@ -288,34 +312,50 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	}
 
 	s.mu.Lock()
-	s.upActive = false
+	s.upParsing--
 	if s.closed {
 		s.mu.Unlock()
 		return 0, ErrClosed
 	}
-	if err != nil || !s.validateBatchLocked(frames) {
+	if err != nil {
 		s.mu.Unlock()
 		s.protocolFailure()
 		return 0, ErrProtocol
 	}
-	reservedCost, reservedItems := s.backendWriteReservationLocked(frames)
+	// The watermark can move while the body is parsed, so an arrival is
+	// classified again here rather than trusting the answer from before the
+	// lock was dropped.
+	if sequence <= s.lastUpSequence {
+		match := s.replayUpLocked(sequence, digest)
+		s.mu.Unlock()
+		if !match {
+			s.protocolFailure()
+			return 0, ErrProtocol
+		}
+		return sequence, nil
+	}
+	if parked, ok := s.upPendingBatches[sequence]; ok {
+		s.mu.Unlock()
+		if !bytes.Equal(digest[:], parked.digest[:]) {
+			s.protocolFailure()
+			return 0, ErrProtocol
+		}
+		return sequence, nil
+	}
+	reservedCost, reservedItems := pendingUpReservation(frames)
 	if (reservedCost != 0 || reservedItems != 0) &&
 		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
 		s.mu.Unlock()
 		return 0, ErrBackpressure
 	}
-	opened, closed, unusedCost, unusedItems, applied := s.applyBatchLocked(
-		frames,
-		reservedCost,
-		reservedItems)
-	if unusedCost != 0 || unusedItems != 0 {
-		s.releasePendingLocked(unusedCost, unusedItems)
+	s.upPendingBatches[sequence] = &pendingUpBatch{
+		frames:        frames,
+		size:          len(body),
+		digest:        digest,
+		reservedCost:  reservedCost,
+		reservedItems: reservedItems,
 	}
-	s.backendWG.Add(len(opened))
-	if applied {
-		s.lastUpSequence = sequence
-		s.lastUpDigest = digest
-	}
+	opened, closed, appliedBytes, drainErr := s.drainUpLocked()
 	s.mu.Unlock()
 
 	for _, value := range closed {
@@ -324,14 +364,104 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	for _, value := range opened {
 		go s.runBackend(value)
 	}
-	if !applied {
-		s.Close()
-		return 0, ErrClosed
+	if drainErr != nil {
+		if errors.Is(drainErr, ErrClosed) {
+			s.Close()
+		} else {
+			s.protocolFailure()
+		}
+		return 0, drainErr
 	}
-	if s.onUp != nil {
-		s.onUp(len(body))
+	if s.onUp != nil && appliedBytes != 0 {
+		s.onUp(appliedBytes)
 	}
 	return sequence, nil
+}
+
+// drainUpLocked applies every parked batch that has become contiguous with the
+// watermark, in sequence order, and returns the streams the caller must open or
+// close once the lock is released. Budget for the writes and the buffered bytes
+// was reserved when the batch arrived, so the only failures here are fatal: an
+// invalid batch in sequence context, or a session that closed underneath it.
+//
+// The caller holds s.mu.
+func (s *Session) drainUpLocked() (
+	[]*backendStream,
+	[]*backendStream,
+	int,
+	error) {
+	var opened, closed []*backendStream
+	appliedBytes := 0
+	for {
+		next := s.lastUpSequence + 1
+		batch := s.upPendingBatches[next]
+		if batch == nil {
+			return opened, closed, appliedBytes, nil
+		}
+		if !s.validateBatchLocked(batch.frames) {
+			return opened, closed, appliedBytes, ErrProtocol
+		}
+		openedHere, closedHere, unusedCost, unusedItems, applied := s.applyBatchLocked(
+			batch.frames,
+			batch.reservedCost,
+			batch.reservedItems)
+		if unusedCost != 0 || unusedItems != 0 {
+			s.releasePendingLocked(unusedCost, unusedItems)
+		}
+		delete(s.upPendingBatches, next)
+		if !applied {
+			return opened, closed, appliedBytes, ErrClosed
+		}
+		s.backendWG.Add(len(openedHere))
+		opened = append(opened, openedHere...)
+		closed = append(closed, closedHere...)
+		s.lastUpSequence = next
+		s.rememberUpDigestLocked(next, batch.digest)
+		appliedBytes += batch.size
+	}
+}
+
+// replayUpLocked reports whether an already-applied sequence carries the body it
+// was applied with. A retry of a lost response is a no-op, but a resend of an
+// applied sequence with different bytes is a protocol violation. The caller
+// holds s.mu.
+func (s *Session) replayUpLocked(sequence uint64, digest [sha256.Size]byte) bool {
+	known, ok := s.upAppliedDigests[sequence]
+	return ok && bytes.Equal(digest[:], known[:])
+}
+
+// rememberUpDigestLocked records the digest of an applied batch. Acks from
+// pipelined batches can interleave, so the last batch alone is not enough: a
+// retry may name any sequence still inside the window the client is allowed to
+// resend.
+func (s *Session) rememberUpDigestLocked(sequence uint64, digest [sha256.Size]byte) {
+	s.upAppliedDigests[sequence] = digest
+	s.upAppliedOrder = append(s.upAppliedOrder, sequence)
+	for len(s.upAppliedOrder)-s.upAppliedStart > s.limits.MaxPipelinedUpBatches+1 {
+		delete(s.upAppliedDigests, s.upAppliedOrder[s.upAppliedStart])
+		s.upAppliedStart++
+	}
+	if s.upAppliedStart > 4096 && s.upAppliedStart*2 >= len(s.upAppliedOrder) {
+		s.upAppliedOrder = append([]uint64(nil), s.upAppliedOrder[s.upAppliedStart:]...)
+		s.upAppliedStart = 0
+	}
+}
+
+// pendingUpReservation bounds the pending budget a batch can consume once it is
+// applied. The exact cost depends on which streams are live at that point, so it
+// is reserved when the batch arrives: over-reserving for a stream that has since
+// closed costs some headroom, while under-reserving would leave an already
+// acknowledged batch unable to land.
+func pendingUpReservation(frames []frame.Frame) (int, int) {
+	cost := 0
+	items := 0
+	for _, value := range frames {
+		if value.StreamID != 0 && value.Type == frame.Data {
+			cost += len(value.Payload) + queueItemCost
+			items++
+		}
+	}
+	return cost, items
 }
 
 func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (uint64, error) {
@@ -1439,6 +1569,9 @@ func (s *Session) closeLocked() {
 	}
 	s.pendingFrames = nil
 	s.pendingWindows = nil
+	s.upPendingBatches = nil
+	s.upAppliedDigests = nil
+	s.upAppliedOrder = nil
 	s.unacked = nil
 	s.unackedCost = 0
 	s.unackedItems = 0
@@ -1584,10 +1717,13 @@ func (s *backendStream) close() {
 	})
 }
 
-// SetUpActiveForTest forces the single-uplink-in-flight flag so tests can
-// exercise the concurrent-uplink path without a real race.
-func (s *Session) SetUpActiveForTest(active bool) {
+// SetUplinkSaturatedForTest fills or empties the in-flight uplink parse slots so
+// tests can exercise the concurrent-uplink path without a real race.
+func (s *Session) SetUplinkSaturatedForTest(saturated bool) {
 	s.mu.Lock()
-	s.upActive = active
+	s.upParsing = 0
+	if saturated {
+		s.upParsing = s.limits.MaxPipelinedUpBatches
+	}
 	s.mu.Unlock()
 }

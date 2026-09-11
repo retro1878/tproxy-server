@@ -319,6 +319,56 @@ func TestUplinkBackpressureIsRetryable(t *testing.T) {
 	}
 }
 
+// Batches that arrive out of order are applied in sequence order, so the relay
+// still hands the backend the client's bytes in the order the client wrote them.
+func TestPipelinedUplinkAppliesReversedBatchesInOrder(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newConfiguredTestServer(t, backend, nil)
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	clientIP := "198.51.100.31"
+	bootstrap, err := application.manager.IssueBootstrap(
+		&application.config.Profiles[0],
+		clientIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := application.manager.Create(
+		bootstrap,
+		clientIP,
+		frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	streamID := uint32(24)
+	batches := [][]byte{
+		frame.Encode(frame.Open, streamID, nil),
+		frame.Encode(frame.Data, streamID, []byte("first")),
+		frame.Encode(frame.Data, streamID, []byte("second")),
+	}
+	// Post newest first: each batch must be accepted and acknowledged while it
+	// waits for the batches before it.
+	for index := len(batches); index != 0; index-- {
+		sequence := strconv.Itoa(index)
+		up := apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/up", created.Token, batches[index-1])
+		up.Header.Set("X-Up-Seq", sequence)
+		response := perform(t, hosted.Client(), up)
+		_ = readResponse(t, response)
+		if response.StatusCode != http.StatusNoContent || response.Header.Get("X-Up-Ack") != sequence {
+			t.Fatalf("reversed batch %s was refused: status=%d ack=%q", sequence, response.StatusCode, response.Header.Get("X-Up-Ack"))
+		}
+	}
+	if _, err := application.manager.Get(created.Token); err != nil {
+		t.Fatal("reversed batches closed the session")
+	}
+	pollForData(t, hosted.Client(), hosted.URL, created.Token, "0", map[uint32][]byte{
+		streamID: []byte("firstsecond"),
+	})
+}
+
 func TestSessionCapacityOverloadIsRetryable(t *testing.T) {
 	backend := startEchoBackend(t)
 	application, _ := newConfiguredTestServer(t, backend, func(value *config.Config) {

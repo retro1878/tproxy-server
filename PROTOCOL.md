@@ -240,27 +240,39 @@ Signed expired or wrong-kind tokens are rejected locally, never delegated to the
 website. Pre-migration random tokens have no verifiable provenance after restart;
 see [HARDENING.md](HARDENING.md) before the first rollout.
 
-### Serialized HTTPS
+### Pipelined HTTPS
 
-In `https` mode, uplink requests are serialized. `X-Up-Seq` begins at `1`. The relay accepts the
-next sequence or a byte-identical retry of the last committed sequence:
+In `https` mode the uplink is pipelined: up to `max_pipelined_up_batches` (default
+`8`) `/up` requests may be in flight at once. `X-Up-Seq` begins at `1` and is assigned
+in dispatch order, so a batch may arrive **ahead** of the sequence the relay has
+committed. The relay buffers such a batch, applies it once the batches before it have
+landed, and applies every contiguous run in sequence order. `X-Up-Ack` names the batch
+just received, not the highest sequence committed:
 
 ```text
 POST /api/v1/up
 Authorization: Bearer session-token
-X-Up-Seq: 1
+X-Up-Seq: 3
 Body: one or more complete frames
 
 204 No Content
-X-Up-Ack: 1
+X-Up-Ack: 3
 ```
 
-If the next valid batch cannot yet fit the relay's DATA queue budget, or a retry
-of the next sequence arrives while the relay is still parsing the previous request
-for it, the relay returns `503 Service Unavailable` with `Retry-After: 1`. The
-sequence remains uncommitted and no frame from the batch is applied. The bridge
-retries the same sequence with the byte-identical body after honouring
-`Retry-After` (a fixed retry count never applies to 503; a 90-second budget does).
+If a valid batch cannot yet fit the relay's DATA queue budget, or all of the window's
+parse slots are in use, the relay returns `503 Service Unavailable` with
+`Retry-After: 1`. The sequence remains uncommitted and no frame from the batch is
+applied. The bridge retries the same sequence with the byte-identical body after
+honouring `Retry-After` (a fixed retry count never applies to 503; a 90-second budget
+does).
+
+A sequence more than `max_pipelined_up_batches` ahead of the committed sequence is a
+protocol error and closes the session, which is what bounds the relay's reorder buffer
+alongside the queue budget. A committed sequence is accepted again only when the body
+is byte-identical to the one committed for it; the relay remembers the digests of the
+last `max_pipelined_up_batches + 1` committed sequences so a retry that is no longer
+the newest one is still verified rather than trusted. Setting
+`max_pipelined_up_batches` to `1` restores strictly serialized uplink requests.
 
 One downlink poll is active at a time and the newest poll wins: when a poll arrives
 while another one is parked (typically because the older connection died silently),
@@ -281,9 +293,10 @@ X-Down-Cursor: 1             X-Down-Cursor: 0
 Body: complete frame batch   Empty body
 ```
 
-The uplink POST and downlink poll run concurrently. With a 2 MiB carrier batch, a
-continuously busy direction has an application-level ceiling of approximately
-`2 MiB / carrier RTT`.
+The uplink POSTs and the downlink poll run concurrently. With a 2 MiB carrier batch, a
+continuously busy downlink has an application-level ceiling of approximately
+`2 MiB / carrier RTT`; the pipelined uplink reaches approximately
+`2 MiB * max_pipelined_up_batches / carrier RTT`, bounded by the queue budget above.
 
 ### Stream-aware HTTPS lanes
 

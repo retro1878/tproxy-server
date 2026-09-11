@@ -179,7 +179,8 @@ func (s *Server) serveBridge(w http.ResponseWriter, r *http.Request, profile *co
 		s.config.BasePath,
 		token,
 		string(profile.CarrierMode.WithDefault()),
-		s.config.Limits.CarrierBatchBytes)
+		s.config.Limits.CarrierBatchBytes,
+		s.config.Limits.MaxPipelinedUpBatches)
 	if err != nil {
 		s.serveNotFound(w, r)
 		return

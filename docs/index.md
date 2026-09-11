@@ -107,7 +107,7 @@ survives a client-secret rotation and needs no re-registration.
 
 | Mode | Shape | Pick it when |
 |---|---|---|
-| `https` (default) | one serialized POST plus one long poll | baseline |
+| `https` (default) | pipelined POSTs plus one long poll | baseline |
 | `https-lanes` | a lane per logical Telegram stream | you want latency isolation; needs HTTP/2 |
 | `websocket` | one WebSocket multiplexing everything | you want to drop HTTP stop-and-wait |
 | `websocket-lanes` | a WebSocket per logical stream | bulk media must not block interactive traffic |

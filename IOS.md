@@ -56,7 +56,7 @@ intentionally emulate the existing Android WebView boundary:
 
 The words `android` and `tproxy-android-init` are legacy wire names in this path,
 not a platform assertion. Reusing them keeps every deployed server compatible. A
-profile may select serialized HTTPS, stream-aware HTTPS lanes, multiplexed WSS,
+profile may select pipelined HTTPS, stream-aware HTTPS lanes, multiplexed WSS,
 or one WSS connection per stream; all four remain inside the server-provided page
 and use the same WKWebView/native message boundary. A future protocol revision can
 introduce platform-neutral names,

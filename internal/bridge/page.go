@@ -19,7 +19,7 @@ type Page struct {
 
 const PermissionsPolicy = "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()"
 
-func Render(hostname, basePath, bootstrapToken, carrierMode string, batchBytes int) (Page, error) {
+func Render(hostname, basePath, bootstrapToken, carrierMode string, batchBytes, upWindow int) (Page, error) {
 	if err := config.ValidateHostname(hostname); err != nil {
 		return Page{}, err
 	}
@@ -28,6 +28,9 @@ func Render(hostname, basePath, bootstrapToken, carrierMode string, batchBytes i
 	}
 	if batchBytes <= 0 || batchBytes > config.MaxCarrierBatchBytes {
 		return Page{}, errors.New("carrier batch size out of range")
+	}
+	if upWindow < 1 {
+		return Page{}, errors.New("uplink window out of range")
 	}
 	if !config.CarrierMode(carrierMode).Valid() {
 		return Page{}, errors.New("invalid carrier mode")
@@ -45,7 +48,8 @@ func Render(hostname, basePath, bootstrapToken, carrierMode string, batchBytes i
 	body = strings.ReplaceAll(body, "__BOOTSTRAP__", string(tokenJSON))
 	body = strings.ReplaceAll(body, "__CARRIER_MODE__", string(carrierJSON))
 	body = strings.ReplaceAll(body, "__BATCH_LIMIT__", strconv.Itoa(batchBytes))
-	if strings.Contains(body, "__NONCE__") || strings.Contains(body, "__RELAY_BASE__") || strings.Contains(body, "__BOOTSTRAP__") || strings.Contains(body, "__CARRIER_MODE__") || strings.Contains(body, "__BATCH_LIMIT__") {
+	body = strings.ReplaceAll(body, "__UP_WINDOW__", strconv.Itoa(upWindow))
+	if strings.Contains(body, "__NONCE__") || strings.Contains(body, "__RELAY_BASE__") || strings.Contains(body, "__BOOTSTRAP__") || strings.Contains(body, "__CARRIER_MODE__") || strings.Contains(body, "__BATCH_LIMIT__") || strings.Contains(body, "__UP_WINDOW__") {
 		return Page{}, errors.New("bridge template replacement failed")
 	}
 	return Page{
@@ -90,8 +94,8 @@ let initialized=false,closed=false,port=null,sessionToken='',createStarted=false
 let queuedBytes=0,queuedItems=0,pollController=null,webSocket=null,webSocketTimer=0;
 const pending=[],upPending=[],lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
 const queueLimit=33554432,queueItemLimit=16384,closedLaneLimit=4096;
-const laneQueueLimit=8388608,laneItemLimit=1024,batchLimit=__BATCH_LIMIT__;
-let upSequence=1,downCursor='0',upRunning=false;
+const laneQueueLimit=8388608,laneItemLimit=1024,batchLimit=__BATCH_LIMIT__,upWindow=__UP_WINDOW__;
+let upSequence=1,downCursor='0',upRunning=0;
 const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
 const pause=milliseconds=>new Promise(resolve=>setTimeout(resolve,milliseconds));
 const options=(method,token,body,headers,signal,keepalive)=>({
@@ -230,17 +234,22 @@ function queueUp(data){
  upPending.push(data);runUp();
 }
 async function runUp(){
- if(upRunning)return;
- upRunning=true;
+ // One dispatcher holds one request in flight, so up to upWindow batches may be
+ // outstanding. The sequence is taken when the batch is dispatched, not when the
+ // response arrives, because a later batch may now be ahead of an earlier one.
+ if(closed||!sessionToken||upRunning>=upWindow)return;
+ upRunning++;
  try{
   while(!closed&&sessionToken&&upPending.length){
    const batch=joinPending(upPending,null),sequence=String(upSequence);
+   upSequence++;
    const response=await request('api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence}));
    if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('uplink rejected');
-   release(batch.total,batch.count,null);port.postMessage({t:'traffic',up:batch.total,down:0});upSequence++;
+   release(batch.total,batch.count,null);port.postMessage({t:'traffic',up:batch.total,down:0});
+   if(!closed&&sessionToken&&upPending.length&&upRunning<upWindow)runUp();
   }
  }catch(error){fail()}
- finally{upRunning=false;if(!closed&&sessionToken&&upPending.length)runUp()}
+ finally{upRunning--}
 }
 async function poll(){
  while(!closed&&sessionToken){

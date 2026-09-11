@@ -13,7 +13,7 @@ func TestWebSocketLaneCancellation(t *testing.T) {
 	if err != nil {
 		t.Skip("node is required to execute the bridge lifecycle test")
 	}
-	page, err := Render("proxy.example.com", "", "bootstrap", "websocket-lanes", 2*1024*1024)
+	page, err := Render("proxy.example.com", "", "bootstrap", "websocket-lanes", 2*1024*1024, 8)
 	if err != nil {
 		t.Fatal(err)
 	}

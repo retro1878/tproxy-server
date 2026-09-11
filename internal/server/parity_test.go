@@ -338,12 +338,12 @@ func TestConcurrentUplinkIsRetryableAndDownlinkSupersedes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	value.SetUpActiveForTest(true)
+	value.SetUplinkSaturatedForTest(true)
 	racing := apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/up", token, frame.Encode(frame.Data, streamID, []byte("more")))
 	racing.Header.Set("X-Up-Seq", "2")
 	racingResponse := perform(t, hosted.Client(), racing)
 	_ = readResponse(t, racingResponse)
-	value.SetUpActiveForTest(false)
+	value.SetUplinkSaturatedForTest(false)
 	if racingResponse.StatusCode != http.StatusServiceUnavailable || racingResponse.Header.Get("Retry-After") != "1" {
 		t.Fatalf("racing uplink got %d (Retry-After %q), want 503 with Retry-After 1", racingResponse.StatusCode, racingResponse.Header.Get("Retry-After"))
 	}

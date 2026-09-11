@@ -201,6 +201,27 @@ func TestProfileStreamDefaultsRespectProfileCeiling(t *testing.T) {
 	}
 }
 
+func TestPipelinedUplinkWindowDefaultsAndValidation(t *testing.T) {
+	if Defaults().Limits.MaxPipelinedUpBatches != 8 {
+		t.Fatalf("unexpected default uplink window: %d", Defaults().Limits.MaxPipelinedUpBatches)
+	}
+	valid := func() Config {
+		value := Defaults()
+		value.PublicHostname = "proxy.example.com"
+		value.PublicUpstream = "http://127.0.0.1:9000"
+		value.ProfilesFile = "profiles.json"
+		return value
+	}
+	if err := valid().validate(); err != nil {
+		t.Fatalf("baseline configuration did not validate: %v", err)
+	}
+	value := valid()
+	value.Limits.MaxPipelinedUpBatches = 0
+	if err := value.validate(); err == nil || err.Error() != "all resource limits must be positive" {
+		t.Fatalf("zero uplink window was not rejected as a limit: %v", err)
+	}
+}
+
 func TestProfileLimitsCannotExceedGlobalCeilings(t *testing.T) {
 	global := Defaults().Limits
 	if err := validateProfileLimits(ProfileLimits{

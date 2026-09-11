@@ -79,6 +79,7 @@ type Limits struct {
 	MaxBodyBytes              int `json:"max_body_bytes"`
 	MaxFramePayload           int `json:"max_frame_payload"`
 	CarrierBatchBytes         int `json:"carrier_batch_bytes"`
+	MaxPipelinedUpBatches     int `json:"max_pipelined_up_batches"`
 	MaxStreamsPerSession      int `json:"max_streams_per_session"`
 	MaxClosedStreamIDs        int `json:"max_closed_stream_ids"`
 	MaxPendingPerSession      int `json:"max_pending_per_session"`
@@ -206,6 +207,7 @@ func Defaults() Config {
 			MaxBodyBytes:              2 * 1024 * 1024,
 			MaxFramePayload:           1024 * 1024,
 			CarrierBatchBytes:         2 * 1024 * 1024,
+			MaxPipelinedUpBatches:     8,
 			MaxStreamsPerSession:      128,
 			MaxClosedStreamIDs:        4096,
 			MaxPendingPerSession:      32 * 1024 * 1024,
@@ -324,6 +326,7 @@ func (c Config) validate() error {
 		return errors.New("carrier_batch_bytes must not exceed the 2 MiB desktop loopback message cap")
 	}
 	values := []int{
+		c.Limits.MaxPipelinedUpBatches,
 		c.Limits.MaxStreamsPerSession, c.Limits.MaxClosedStreamIDs,
 		c.Limits.MaxPendingPerSession, c.Limits.MaxPendingGlobal,
 		c.Limits.MaxPendingItemsPerSession, c.Limits.MaxPendingItemsGlobal,

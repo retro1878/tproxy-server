@@ -13,6 +13,7 @@
     "max_body_bytes": 2097152,
     "max_frame_payload": 1048576,
     "carrier_batch_bytes": 2097152,
+    "max_pipelined_up_batches": 8,
     "max_streams_per_session": 128,
     "max_closed_stream_ids": 4096,
     "max_pending_per_session": 33554432,

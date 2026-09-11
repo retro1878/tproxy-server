@@ -47,7 +47,7 @@ decrypt the MTProxy stream.
 
 “One WebView transport” means one logical carrier and relay session for the app,
 not one HTTP request or backend connection. The profile may use the original
-serialized HTTPS carrier, independent HTTPS request lanes per Telegram logical
+pipelined HTTPS carrier, independent HTTPS request lanes per Telegram logical
 session, one multiplexed WebSocket, or an independent WebSocket per logical
 session.
 
@@ -512,7 +512,7 @@ client secret, and numeric loopback backend:
 
 | Mode | Carrier behavior | Primary tradeoff |
 |---|---|---|
-| `https` | one serialized POST plus one long poll | conservative baseline; one direction is capped near `carrier_batch_bytes / RTT` |
+| `https` | pipelined POSTs plus one long poll | conservative baseline; up to `max_pipelined_up_batches` uplink requests overlap, the downlink is capped near `carrier_batch_bytes / RTT` |
 | `https-lanes` | independent POST sequence and long poll for every logical stream | mirrors Telegram TCP sessions and isolates latency; relies on HTTP/2 for many concurrent polls |
 | `websocket` | one ordered WebSocket multiplexing all streams | removes HTTP stop-and-wait with one connection; all streams share its TCP congestion and failure domain |
 | `websocket-lanes` | one ordered WebSocket for every logical stream | isolates browser and relay queues so bulk media does not block interactive streams; increases connection and handshake count |

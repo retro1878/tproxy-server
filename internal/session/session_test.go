@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -524,15 +525,11 @@ func TestConcurrentUplinkIsRejectedAndNewestPollWins(t *testing.T) {
 		t.Fatal("a superseded poll closed the session")
 	}
 
-	value.mu.Lock()
-	value.upActive = true
-	value.mu.Unlock()
+	value.SetUplinkSaturatedForTest(true)
 	if _, err := value.ProcessUp(1, frame.Encode(frame.Open, 13, nil)); !errors.Is(err, ErrConcurrent) {
 		t.Fatalf("concurrent uplink was accepted: %v", err)
 	}
-	value.mu.Lock()
-	value.upActive = false
-	value.mu.Unlock()
+	value.SetUplinkSaturatedForTest(false)
 }
 
 func TestSessionCloseStopsBackendGoroutines(t *testing.T) {
@@ -1097,5 +1094,237 @@ func TestEvictedLaneReleasesBudgetAndIgnoresLateFrames(t *testing.T) {
 	value.mu.Unlock()
 	if closed {
 		t.Fatal("late DATA for an evicted lane closed the session")
+	}
+}
+
+// acceptBackend returns the next backend connection the session dials, so a test
+// can observe what the relay actually forwarded.
+func acceptBackend(t *testing.T, listener net.Listener) net.Conn {
+	t.Helper()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		connection, err := listener.Accept()
+		if err == nil {
+			accepted <- connection
+		}
+	}()
+	select {
+	case connection := <-accepted:
+		return connection
+	case <-time.After(2 * time.Second):
+		t.Fatal("backend connection was not established")
+		return nil
+	}
+}
+
+func readBackend(t *testing.T, connection net.Conn, want string) {
+	t.Helper()
+	_ = connection.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buffer := make([]byte, len(want))
+	if _, err := io.ReadFull(connection, buffer); err != nil {
+		t.Fatalf("backend read: %v", err)
+	}
+	if string(buffer) != want {
+		t.Fatalf("backend received %q, want %q", buffer, want)
+	}
+}
+
+func pipelinedWatermark(t *testing.T, value *Session) (uint64, int) {
+	t.Helper()
+	value.mu.Lock()
+	defer value.mu.Unlock()
+	return value.lastUpSequence, len(value.upPendingBatches)
+}
+
+// A batch that arrives before the batch it depends on must be held, not applied
+// and not fatal: DATA for a stream whose OPEN is still in flight is only valid
+// once that OPEN has landed.
+func TestPipelinedOutOfOrderBatchesApplyInSequence(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	configuration := testConfig(listener.Addr().String())
+	manager := NewManager(configuration, [32]byte{1})
+	defer manager.Shutdown()
+	bootstrap, err := manager.IssueBootstrap(&configuration.Profiles[0], "198.51.100.20")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(bootstrap, "198.51.100.20", frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opened := frame.Encode(frame.Open, 30, nil)
+	payload := frame.Encode(frame.Data, 30, []byte("pipelined"))
+	if ack, err := created.Session.ProcessUp(2, payload); err != nil || ack != 2 {
+		t.Fatalf("ahead batch was not accepted: ack=%d error=%v", ack, err)
+	}
+	if watermark, buffered := pipelinedWatermark(t, created.Session); watermark != 0 || buffered != 1 {
+		t.Fatalf("ahead batch was applied or dropped: watermark=%d buffered=%d", watermark, buffered)
+	}
+	if ack, err := created.Session.ProcessUp(1, opened); err != nil || ack != 1 {
+		t.Fatalf("contiguous batch failed: ack=%d error=%v", ack, err)
+	}
+	if watermark, buffered := pipelinedWatermark(t, created.Session); watermark != 2 || buffered != 0 {
+		t.Fatalf("reordered batches did not drain in sequence: watermark=%d buffered=%d", watermark, buffered)
+	}
+	if _, err := manager.Get(created.Token); err != nil {
+		t.Fatal("out-of-order arrival closed the session")
+	}
+
+	peer := acceptBackend(t, listener)
+	defer peer.Close()
+	readBackend(t, peer, "pipelined")
+
+	// The bytes reaching the backend queue a flow-control frame for the client.
+	// Taking it and acknowledging it is what releases the last of the budget
+	// reserved for the reordered batch.
+	frameBody, cursor, err := created.Session.Poll(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flowControl, err := frame.ParseAll(frameBody, frame.MaxPayload)
+	if err != nil || len(flowControl) != 1 || flowControl[0].Type != frame.Window {
+		t.Fatalf("backend write did not queue one window frame: frames=%v error=%v", flowControl, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, _, err := created.Session.Poll(ctx, cursor); err == nil {
+		t.Fatal("expected the empty acknowledgment poll to wait out its context")
+	}
+	waitFor(t, func() bool {
+		manager.mu.Lock()
+		defer manager.mu.Unlock()
+		return manager.pendingGlobalCost == 0 && manager.pendingGlobalItems == 0
+	})
+}
+
+// A hole inside the window stops the drain until it is filled, after which the
+// whole run is applied in order.
+func TestPipelinedGapWithinWindowBuffersUntilFilled(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	configuration := testConfig(listener.Addr().String())
+	manager := NewManager(configuration, [32]byte{1})
+	defer manager.Shutdown()
+	bootstrap, err := manager.IssueBootstrap(&configuration.Profiles[0], "198.51.100.21")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(bootstrap, "198.51.100.21", frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	opened := frame.Encode(frame.Open, 31, nil)
+	first := frame.Encode(frame.Data, 31, []byte("x"))
+	second := frame.Encode(frame.Data, 31, []byte("y"))
+	if ack, err := created.Session.ProcessUp(3, second); err != nil || ack != 3 {
+		t.Fatalf("batch past a hole was not accepted: ack=%d error=%v", ack, err)
+	}
+	if ack, err := created.Session.ProcessUp(1, opened); err != nil || ack != 1 {
+		t.Fatalf("opening batch failed: ack=%d error=%v", ack, err)
+	}
+	if watermark, buffered := pipelinedWatermark(t, created.Session); watermark != 1 || buffered != 1 {
+		t.Fatalf("drain crossed a hole: watermark=%d buffered=%d", watermark, buffered)
+	}
+	if ack, err := created.Session.ProcessUp(2, first); err != nil || ack != 2 {
+		t.Fatalf("filling batch failed: ack=%d error=%v", ack, err)
+	}
+	if watermark, buffered := pipelinedWatermark(t, created.Session); watermark != 3 || buffered != 0 {
+		t.Fatalf("filled run did not drain: watermark=%d buffered=%d", watermark, buffered)
+	}
+
+	peer := acceptBackend(t, listener)
+	defer peer.Close()
+	readBackend(t, peer, "xy")
+}
+
+func TestPipelinedSequencePastWindowFailsSession(t *testing.T) {
+	manager, token, value := testSession(t)
+	defer manager.Shutdown()
+
+	configuration := testConfig("127.0.0.1:1")
+	window := configuration.Limits.MaxPipelinedUpBatches
+	body := frame.Encode(frame.Open, 40, nil)
+	if _, err := value.ProcessUp(uint64(window)+1, body); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("sequence past the window was accepted: %v", err)
+	}
+	waitFor(t, func() bool {
+		_, err := manager.Get(token)
+		return err != nil
+	})
+}
+
+func TestPipelinedReplayUsesRecordedDigests(t *testing.T) {
+	manager, _, value := testSession(t)
+	defer manager.Shutdown()
+
+	opened := frame.Encode(frame.Open, 41, nil)
+	payload := frame.Encode(frame.Data, 41, []byte("z"))
+	if _, err := value.ProcessUp(1, opened); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := value.ProcessUp(2, payload); err != nil {
+		t.Fatal(err)
+	}
+	if ack, err := value.ProcessUp(1, append([]byte(nil), opened...)); err != nil || ack != 1 {
+		t.Fatalf("replay of an applied batch was rejected: ack=%d error=%v", ack, err)
+	}
+	if _, err := value.ProcessUp(1, append([]byte(nil), payload...)); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("replayed sequence with different bytes was accepted: %v", err)
+	}
+}
+
+func TestPipelinedBufferedResendMustMatch(t *testing.T) {
+	manager, _, value := testSession(t)
+	defer manager.Shutdown()
+
+	if _, err := value.ProcessUp(2, frame.Encode(frame.Open, 42, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if ack, err := value.ProcessUp(2, frame.Encode(frame.Open, 42, nil)); err != nil || ack != 2 {
+		t.Fatalf("identical resend of a buffered batch was rejected: ack=%d error=%v", ack, err)
+	}
+	if _, err := value.ProcessUp(2, frame.Encode(frame.Open, 43, nil)); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("buffered sequence resend with different bytes was accepted: %v", err)
+	}
+}
+
+// The reorder buffer is bounded by the pending budget: a batch that does not fit
+// is refused so the client retries, rather than being buffered in the hope that
+// budget appears.
+func TestPipelinedByteCapBackpressuresInsteadOfBuffering(t *testing.T) {
+	manager, token, value := testSession(t)
+	defer manager.Shutdown()
+
+	value.limits.MaxPendingPerSession = 64
+	value.limits.MaxPendingItemsPerSession = 4
+	manager.mu.Lock()
+	manager.config.Limits.MaxPendingGlobal = 64
+	manager.config.Limits.MaxPendingItemsGlobal = 4
+	manager.mu.Unlock()
+
+	heavy := frame.Encode(frame.Data, 44, bytes.Repeat([]byte("a"), 4096))
+	if _, err := value.ProcessUp(1, heavy); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("oversized batch was not refused: %v", err)
+	}
+	if watermark, buffered := pipelinedWatermark(t, value); watermark != 0 || buffered != 0 {
+		t.Fatalf("refused batch was buffered or applied: watermark=%d buffered=%d", watermark, buffered)
+	}
+	if _, err := manager.Get(token); err != nil {
+		t.Fatal("backpressure closed the session")
+	}
+	capacity := manager.Capacity()
+	if capacity.PendingBytes != 0 || capacity.PendingItems != 0 {
+		t.Fatalf("refused batch retained budget: bytes=%d items=%d", capacity.PendingBytes, capacity.PendingItems)
 	}
 }
