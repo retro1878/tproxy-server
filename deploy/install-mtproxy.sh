@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# deploy/install.sh sets umask 077, which this script inherits. make creates its
+# outputs as 0777 & ~umask, so the binary and objs/ landed as 0700 root:root and
+# mtproxy.service, which runs as User=mtproxy, could not execute them (systemd
+# reports 203/EXEC). The artifacts must be traversable and executable by that
+# user, so the build runs under a conventional umask instead.
+umask 022
+
 if [[ "${EUID}" -ne 0 ]]; then
 	echo "run this installer as root" >&2
 	exit 1
@@ -47,6 +54,11 @@ if [[ ! -x "$source_directory/objs/bin/mtproto-proxy" ]] ||
 	trap - EXIT
 	rm -rf "$temporary"
 fi
+
+# Enforce the modes the service user needs on every run. The build guard above
+# skips work whenever the binary exists and is executable, so an installation
+# left with 0700 artifacts by an earlier run would otherwise stay broken.
+chmod 0755 "$source_directory/objs" "$source_directory/objs/bin" "$source_directory/objs/bin/mtproto-proxy"
 
 install -d -o root -g mtproxy -m 0750 /etc/mtproxy
 secret_temp="$(mktemp /etc/mtproxy/proxy-secret.XXXXXX)"

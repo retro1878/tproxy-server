@@ -234,6 +234,12 @@ func TestLoadAcceptsSystemdCredentialReadPermissions(t *testing.T) {
 	if err := os.WriteFile(profiles, []byte(content), 0444); err != nil {
 		t.Fatal(err)
 	}
+	// WriteFile's mode is masked by the process umask, so set the group/other
+	// readable mode explicitly: the assertions below depend on it being present
+	// and would otherwise silently test a 0600 file under umask 077.
+	if err := os.Chmod(profiles, 0444); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("CREDENTIALS_DIRECTORY", credentials)
 	server := `{"public_hostname":"proxy.example.com","public_dir":"public","profiles_file":"credentials/profiles.json"}`
 	path := filepath.Join(directory, "config.json")
