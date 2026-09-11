@@ -14,7 +14,7 @@ mtproxy_max_connections=4096
 mtproxy_tag=
 
 usage() {
-	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096] [--mtproxy-tag 32-hex]" >&2
+	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex|random] [--mtproxy-workers 1] [--mtproxy-max-connections 4096] [--mtproxy-tag 32-hex]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -40,6 +40,13 @@ fi
 if [[ "$(uname -m)" != "x86_64" ]]; then
 	echo "the stock official MTProxy build requires an x86_64 server" >&2
 	exit 1
+fi
+# "random" draws a fresh 16-byte secret so a first install can run unattended.
+# It cannot collide with a real value, since a secret is hex. On a reinstall
+# this rotates the secret and invalidates every client link already handed out,
+# so it is not a substitute for passing the existing one.
+if [[ "$secret" == random ]]; then
+	secret="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d '[:space:]')"
 fi
 if [[ -z "$secret" ]]; then
 	read -r -s -p "WEB proxy secret (32 hex, optionally prefixed with dd): " secret
