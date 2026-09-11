@@ -16,8 +16,14 @@ Environment=MTPROXY_MAX_CONNECTIONS=4096
 # MTProxy hashes the wrong address into its middle-end keys and silently
 # answers no client. Unquoted so an empty value expands to no argument.
 Environment=MTPROXY_NAT_ARGS=
+# Empty unless a promo tag is configured. When set, the installer writes
+# "-P <32 hex>" and mtproto-proxy annotates every query it forwards to the
+# middle-end with that tag, which is what links this proxy to a Telegram
+# channel. Unquoted for the same reason as the NAT arguments, and it must stay
+# unset rather than empty: -P without a value aborts the proxy at startup.
+Environment=MTPROXY_TAG_ARG=
 WorkingDirectory=/opt/MTProxy
-ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy -u mtproxy -p 8888 -H 2398 -S ${MTPROXY_SECRET} $MTPROXY_NAT_ARGS --aes-pwd /etc/mtproxy/proxy-secret /etc/mtproxy/proxy-multi.conf -M ${MTPROXY_WORKERS} -C ${MTPROXY_MAX_CONNECTIONS}
+ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy -u mtproxy -p 8888 -H 2398 -S ${MTPROXY_SECRET} $MTPROXY_NAT_ARGS --aes-pwd /etc/mtproxy/proxy-secret /etc/mtproxy/proxy-multi.conf -M ${MTPROXY_WORKERS} -C ${MTPROXY_MAX_CONNECTIONS} $MTPROXY_TAG_ARG
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576

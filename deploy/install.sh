@@ -11,9 +11,10 @@ site_upstream=
 static_routes=exact
 mtproxy_workers=1
 mtproxy_max_connections=4096
+mtproxy_tag=
 
 usage() {
-	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096]" >&2
+	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096] [--mtproxy-tag 32-hex]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
 		--static-routes) static_routes="${2:-}"; shift 2 ;;
 		--mtproxy-workers) mtproxy_workers="${2:-}"; shift 2 ;;
 		--mtproxy-max-connections) mtproxy_max_connections="${2:-}"; shift 2 ;;
+		--mtproxy-tag) mtproxy_tag="${2:-}"; shift 2 ;;
 		*) usage; exit 2 ;;
 	esac
 done
@@ -88,6 +90,10 @@ if [[ ! "$mtproxy_workers" =~ ^[1-9][0-9]*$ ]] || ((mtproxy_workers > 256)); the
 fi
 if [[ ! "$mtproxy_max_connections" =~ ^[1-9][0-9]*$ ]]; then
 	echo "mtproxy max connections must be positive" >&2
+	exit 2
+fi
+if [[ -n "$mtproxy_tag" ]] && [[ ! "$mtproxy_tag" =~ ^[0-9a-fA-F]{32}$ ]]; then
+	echo "--mtproxy-tag must be the 32 hex digits of the 16-byte tag from @MTProxybot" >&2
 	exit 2
 fi
 
@@ -264,11 +270,25 @@ elif [[ "$local_address" =~ ^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-
 	echo "/etc/mtproxy/mtproxy.env or MTProxy will accept clients and answer none" >&2
 fi
 
+# This file is rewritten on every run, so an existing promo tag is carried over
+# when --mtproxy-tag is not passed. Losing it would silently stop channel
+# promotion without an error anywhere.
+if [[ -z "$mtproxy_tag" ]] && [[ -f /etc/mtproxy/mtproxy.env ]]; then
+	mtproxy_tag="$(sed -n 's/^MTPROXY_TAG_ARG=-P[[:space:]]*\([0-9a-fA-F]\{32\}\)[[:space:]]*$/\1/p' /etc/mtproxy/mtproxy.env | head -n1)"
+fi
+# mtproto-proxy aborts when -P is given no value, so the argument is omitted
+# entirely when there is no tag rather than expanded empty, as with the NAT args.
+mtproxy_tag_arg=
+if [[ -n "$mtproxy_tag" ]]; then
+	mtproxy_tag_arg="-P $mtproxy_tag"
+fi
+
 cat > /etc/mtproxy/mtproxy.env <<EOF
 MTPROXY_SECRET=$backend_secret
 MTPROXY_WORKERS=$mtproxy_workers
 MTPROXY_MAX_CONNECTIONS=$mtproxy_max_connections
 MTPROXY_NAT_ARGS=$mtproxy_nat_args
+MTPROXY_TAG_ARG=$mtproxy_tag_arg
 EOF
 chown root:mtproxy /etc/mtproxy/mtproxy.env
 chmod 0640 /etc/mtproxy/mtproxy.env
@@ -353,6 +373,9 @@ proxy_secret="$(web_proxy_secret)"
 echo
 echo "Installed for https://$hostname/$base_path"
 echo "Internal mtproxy secret: $secret"
+if [[ -n "$mtproxy_tag" ]]; then
+	echo "Promo tag:               $mtproxy_tag"
+fi
 echo "Proxy server:            $client_address"
 echo "Proxy secret:            $proxy_secret"
 echo "Proxy link:              https://t.me/webproxy?server=${client_address//\//%2F}&secret=$proxy_secret"
