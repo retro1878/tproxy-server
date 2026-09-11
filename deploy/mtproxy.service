@@ -23,7 +23,12 @@ Environment=MTPROXY_NAT_ARGS=
 # unset rather than empty: -P without a value aborts the proxy at startup.
 Environment=MTPROXY_TAG_ARG=
 WorkingDirectory=/opt/MTProxy
-ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy -u mtproxy -p 8888 -H 2398 -S ${MTPROXY_SECRET} $MTPROXY_NAT_ARGS --aes-pwd /etc/mtproxy/proxy-secret /etc/mtproxy/proxy-multi.conf -M ${MTPROXY_WORKERS} -C ${MTPROXY_MAX_CONNECTIONS} $MTPROXY_TAG_ARG
+# --http-stats is what makes -p above mean anything: it registers the /stats
+# handler and clears the engine's ENGINE_NO_PORT flag, so without it no port is
+# opened and -p 8888 silently does nothing. The handler answers only loopback
+# clients and only on /stats, and firewall.nft drops 8888 on every other
+# interface, so this stays a local readout.
+ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy -u mtproxy -p 8888 -H 2398 -S ${MTPROXY_SECRET} $MTPROXY_NAT_ARGS --aes-pwd /etc/mtproxy/proxy-secret /etc/mtproxy/proxy-multi.conf -M ${MTPROXY_WORKERS} -C ${MTPROXY_MAX_CONNECTIONS} --http-stats $MTPROXY_TAG_ARG
 Restart=on-failure
 RestartSec=3s
 LimitNOFILE=1048576
