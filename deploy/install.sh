@@ -13,9 +13,10 @@ mtproxy_workers=1
 mtproxy_max_connections=4096
 mtproxy_tag=
 carrier_mode=
+behind_cdn=
 
 usage() {
-	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex|random] [--mtproxy-workers 1] [--mtproxy-max-connections 4096] [--mtproxy-tag 32-hex] [--carrier-mode https|https-lanes|websocket|websocket-lanes]" >&2
+	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex|random] [--mtproxy-workers 1] [--mtproxy-max-connections 4096] [--mtproxy-tag 32-hex] [--carrier-mode https|https-lanes|websocket|websocket-lanes] [--behind-cdn]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -31,6 +32,7 @@ while [[ $# -gt 0 ]]; do
 		--mtproxy-max-connections) mtproxy_max_connections="${2:-}"; shift 2 ;;
 		--mtproxy-tag) mtproxy_tag="${2:-}"; shift 2 ;;
 		--carrier-mode) carrier_mode="${2:-}"; shift 2 ;;
+		--behind-cdn) behind_cdn=1; shift ;;
 		*) usage; exit 2 ;;
 	esac
 done
@@ -233,6 +235,14 @@ if [[ -n "$site_upstream" ]]; then
 else
 	public_source='  "public_dir": "/srv/tproxy-site",'
 fi
+# Behind a CDN every client reaches the relay from the edge's addresses, so a
+# per-IP cap would count everyone behind one edge as a single client and start
+# rejecting ordinary users in batches. Both fields already default to 0 (off);
+# pinning them keeps that true if the defaults ever change.
+limits_source=
+if [[ -n "$behind_cdn" ]]; then
+	limits_source='  "limits": {"max_sessions_per_ip": 0, "max_bootstraps_per_ip": 0},'
+fi
 
 install -d -o root -g tproxy -m 0750 /etc/tproxy-server
 bash "$repository/deploy/ensure-token-key.sh"
@@ -243,6 +253,7 @@ cat > /etc/tproxy-server/config.json <<EOF
   "listen": "127.0.0.1:8080",
   "admin_listen": "127.0.0.1:8081",
 $public_source
+$limits_source
   "static_routes": "$static_routes",
   "profiles_file": "/run/credentials/tproxy-server.service/profiles.json"
 }
@@ -425,3 +436,37 @@ echo "Proxy link:              https://t.me/webproxy?server=${client_address//\/
 echo "Check: systemctl --no-pager --full status caddy mtproxy tproxy-server"
 echo "Check: curl --fail https://$hostname/"
 echo "Check: curl --fail http://127.0.0.1:8081/readyz"
+
+if [[ -n "$behind_cdn" ]]; then
+	echo
+	echo "Cloudflare"
+	cdn_headers=
+	if ! cdn_headers="$(curl --fail --silent --show-error --max-time 20 --head "https://$hostname/" 2>/dev/null)"; then
+		cdn_headers=
+	fi
+	if [[ -z "$cdn_headers" ]]; then
+		echo "  could not fetch https://$hostname/; check DNS and the orange cloud"
+	elif ! grep -qi '^cf-ray:' <<<"$cdn_headers"; then
+		echo "  no CF-Ray header: this name is not going through Cloudflare yet"
+		echo "  turn the orange cloud on, then set SSL/TLS to Full (strict)"
+	else
+		echo "  CF-Ray present: the name is proxied"
+	fi
+	# The relay answers 404 to any cookie-bearing carrier request, so an edge
+	# that sets a cookie breaks the proxy with no error the operator can trace.
+	if grep -qi '^set-cookie:' <<<"$cdn_headers"; then
+		echo "  WARNING: the edge set a cookie. The relay answers 404 to a"
+		echo "  cookie-bearing carrier request, so nothing will connect."
+		echo "  Turn off Bot Fight Mode and every challenge on this hostname."
+	fi
+	echo "  Also required, and outside this installer's reach:"
+	echo "   - turn off HTML-rewriting and script-injecting edge features; the"
+	echo "     bridge document is served under a nonce CSP and any injection"
+	echo "     either breaks it or is blocked by it"
+	echo "   - leave trusted_proxies unset in the Caddyfile; a two-IP"
+	echo "     X-Forwarded-For chain makes the bridge and API answer 404"
+	echo "   - confirm certificate renewal; TLS-ALPN-01 cannot complete through"
+	echo "     an orange cloud, so Caddy has to fall back to HTTP-01"
+	echo "  Per-IP limits are pinned to 0: behind the edge they would count the"
+	echo "  edge, not the user."
+fi

@@ -3,6 +3,12 @@
 	admin off
 	servers {
 		protocols h1 h2
+		# Never add trusted_proxies here. The relay takes the client address from
+		# X-Forwarded-For and requires it to be exactly one IP; marking a peer
+		# trusted makes Caddy append rather than replace, and the relay then
+		# answers 404 to the bridge and the API, which reads as the proxy
+		# silently dying. Behind a CDN the field is meaningless anyway, since
+		# Caddy would only ever be naming the edge, never the user.
 		# read_body maps to Go's ReadTimeout; it must stay well above the
 		# relay's long_poll (25s) so parked polls are never cut, while still
 		# bounding a slow-body client at this hop too.
