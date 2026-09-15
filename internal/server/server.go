@@ -683,6 +683,11 @@ func (s *Server) serveReady(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, profile := range s.config.Profiles {
+		if profile.Kind == config.KindTunnel {
+			// A tunnel profile has no fixed backend: every stream dials the
+			// destination its client named, so there is nothing to probe here.
+			continue
+		}
 		connection, err := net.DialTimeout("tcp", profile.Backend, s.config.Timeouts.BackendDial.Value())
 		if err != nil {
 			http.Error(w, "backend unavailable", http.StatusServiceUnavailable)

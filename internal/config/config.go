@@ -128,16 +128,40 @@ type Config struct {
 	LegacyTokenDrain bool      `json:"-"`
 }
 
+// ProfileKind selects what a profile's streams connect to. An mtproxy profile
+// dials its fixed local MTProxy backend, which carries Telegram only. A tunnel
+// profile dials the destination its client names in the OPEN frame instead, so
+// it can carry any TCP service.
+type ProfileKind string
+
+const (
+	KindMTProxy ProfileKind = "mtproxy"
+	KindTunnel  ProfileKind = "tunnel"
+)
+
+func (k ProfileKind) Valid() bool {
+	return k == KindMTProxy || k == KindTunnel
+}
+
+func (k ProfileKind) WithDefault() ProfileKind {
+	if k == "" {
+		return KindMTProxy
+	}
+	return k
+}
+
 type profileFile struct {
 	Profiles []profileInput `json:"profiles"`
 }
 
 type profileInput struct {
-	Name        string        `json:"name"`
-	Secret      string        `json:"secret"`
-	Backend     string        `json:"backend"`
-	CarrierMode CarrierMode   `json:"carrier_mode"`
-	Limits      ProfileLimits `json:"limits"`
+	Name                string        `json:"name"`
+	Secret              string        `json:"secret"`
+	Kind                ProfileKind   `json:"kind"`
+	Backend             string        `json:"backend"`
+	AllowPrivateTargets bool          `json:"allow_private_targets"`
+	CarrierMode         CarrierMode   `json:"carrier_mode"`
+	Limits              ProfileLimits `json:"limits"`
 }
 
 type ProfileLimits struct {
@@ -153,11 +177,13 @@ type ProfileLimits struct {
 }
 
 type Profile struct {
-	Name        string
-	Backend     string
-	CarrierMode CarrierMode
-	Capability  [sha256.Size]byte
-	Limits      ProfileLimits
+	Name                string
+	Kind                ProfileKind
+	Backend             string
+	AllowPrivateTargets bool
+	CarrierMode         CarrierMode
+	Capability          [sha256.Size]byte
+	Limits              ProfileLimits
 }
 
 func (limits ProfileLimits) WithDefaults(global Limits) ProfileLimits {
@@ -559,7 +585,18 @@ func loadProfiles(path, host, basePath string, limits Limits) ([]Profile, error)
 		if _, exists := names[input.Name]; exists {
 			return nil, fmt.Errorf("duplicate profile name %q", input.Name)
 		}
-		if err := validateLoopbackAddress(input.Backend); err != nil {
+		kind := input.Kind.WithDefault()
+		if !kind.Valid() {
+			return nil, fmt.Errorf("profile %q kind must be mtproxy or tunnel", input.Name)
+		}
+		// A tunnel profile dials the destination its client names in OPEN, so it
+		// has no fixed backend to validate; an MTProxy profile always dials the
+		// local proxy and must not be pointed anywhere else.
+		if kind == KindTunnel {
+			if input.Backend != "" {
+				return nil, fmt.Errorf("profile %q backend must be empty for a tunnel profile", input.Name)
+			}
+		} else if err := validateLoopbackAddress(input.Backend); err != nil {
 			return nil, fmt.Errorf("profile %q backend: %w", input.Name, err)
 		}
 		carrierMode := input.CarrierMode.WithDefault()
@@ -582,11 +619,13 @@ func loadProfiles(path, host, basePath string, limits Limits) ([]Profile, error)
 			return nil, fmt.Errorf("duplicate capability for profile %q", input.Name)
 		}
 		result = append(result, Profile{
-			Name:        input.Name,
-			Backend:     input.Backend,
-			CarrierMode: carrierMode,
-			Capability:  capability,
-			Limits:      profileLimits,
+			Name:                input.Name,
+			Kind:                kind,
+			Backend:             input.Backend,
+			AllowPrivateTargets: kind == KindTunnel && input.AllowPrivateTargets,
+			CarrierMode:         carrierMode,
+			Capability:          capability,
+			Limits:              profileLimits,
 		})
 		names[input.Name] = struct{}{}
 		capabilities[capability] = struct{}{}

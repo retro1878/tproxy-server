@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -187,6 +188,86 @@ func TestProfileCarrierModeDefaultsAndValidation(t *testing.T) {
 	writeProfiles(`,"carrier_mode":"unknown"`)
 	if _, err := Load(configPath); err == nil {
 		t.Fatal("invalid carrier mode was accepted")
+	}
+}
+
+func TestProfileKindHelpers(t *testing.T) {
+	if ProfileKind("").WithDefault() != KindMTProxy {
+		t.Fatal("an omitted kind did not default to mtproxy")
+	}
+	if KindTunnel.WithDefault() != KindTunnel {
+		t.Fatal("a chosen kind was overwritten by the default")
+	}
+	if !KindMTProxy.Valid() || !KindTunnel.Valid() {
+		t.Fatal("a known kind was rejected")
+	}
+	if ProfileKind("relay").Valid() {
+		t.Fatal("an unknown kind was accepted")
+	}
+}
+
+func TestTunnelProfileKind(t *testing.T) {
+	// The profiles_file permission check in this suite is Unix-only: Windows
+	// reports the same permission bits for every file, so loading any profiles
+	// file there fails for unrelated reasons.
+	if runtime.GOOS == "windows" {
+		t.Skip("profiles_file permission checks require Unix file modes")
+	}
+	directory := t.TempDir()
+	public := filepath.Join(directory, "public")
+	if err := os.Mkdir(public, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(public, "index.html"), []byte("site"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	profilesPath := filepath.Join(directory, "profiles.json")
+	writeProfiles := func(body string) {
+		if err := os.WriteFile(profilesPath, []byte(`{"profiles":[`+body+`]}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := `{"public_hostname":"proxy.example.com","public_dir":"public","profiles_file":"profiles.json"}`
+	configPath := filepath.Join(directory, "config.json")
+	if err := os.WriteFile(configPath, []byte(server), 0600); err != nil {
+		t.Fatal(err)
+	}
+	const secret = `"secret":"000102030405060708090a0b0c0d0e0f"`
+
+	// A tunnel profile names its destination per stream, so it has no backend.
+	writeProfiles(`{"name":"tunnel","kind":"tunnel","allow_private_targets":true,` + secret + `}`)
+	loaded, err := Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tunnel := loaded.Profiles[0]
+	if tunnel.Kind != KindTunnel || tunnel.Backend != "" || !tunnel.AllowPrivateTargets {
+		t.Fatalf("tunnel profile was not loaded as expected: %#v", tunnel)
+	}
+
+	// An omitted kind keeps serving what existing files already describe.
+	writeProfiles(`{"name":"default","backend":"127.0.0.1:2398",` + secret + `}`)
+	loaded, err = Load(configPath)
+	if err != nil || loaded.Profiles[0].Kind != KindMTProxy {
+		t.Fatalf("an omitted kind did not default to mtproxy: %#v %v", loaded.Profiles, err)
+	}
+	// allow_private_targets means nothing for an MTProxy profile, which dials
+	// only its own loopback backend.
+	writeProfiles(`{"name":"default","backend":"127.0.0.1:2398","allow_private_targets":true,` + secret + `}`)
+	loaded, err = Load(configPath)
+	if err != nil || loaded.Profiles[0].AllowPrivateTargets {
+		t.Fatalf("an MTProxy profile kept allow_private_targets: %#v %v", loaded.Profiles, err)
+	}
+
+	// A tunnel profile must not also carry a fixed backend, and an unknown kind
+	// is refused rather than silently treated as the default.
+	writeProfiles(`{"name":"tunnel","kind":"tunnel","backend":"127.0.0.1:2398",` + secret + `}`)
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("a tunnel profile with a backend was accepted")
+	}
+	writeProfiles(`{"name":"default","kind":"relay","backend":"127.0.0.1:2398",` + secret + `}`)
+	if _, err := Load(configPath); err == nil {
+		t.Fatal("an unknown profile kind was accepted")
 	}
 }
 
