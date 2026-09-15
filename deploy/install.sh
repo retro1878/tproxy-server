@@ -475,6 +475,14 @@ fi
 echo "Proxy server:            $client_address"
 echo "Proxy secret:            $proxy_secret"
 echo "Proxy link:              https://t.me/webproxy?server=${client_address//\//%2F}&secret=$proxy_secret"
+# A tunnel client is configured with the hostname and its own secret and derives
+# the bridge capability itself, so the secret is the whole configuration. It is
+# printed rather than written anywhere else: this is the only place a first
+# install reports it.
+if [[ -n "$tunnel_secret" ]]; then
+	echo "Tunnel server:           $client_address"
+	echo "Tunnel secret:           $tunnel_secret"
+fi
 echo "Check: systemctl --no-pager --full status caddy mtproxy tproxy-server"
 echo "Check: curl --fail https://$hostname/"
 echo "Check: curl --fail http://127.0.0.1:8081/readyz"
