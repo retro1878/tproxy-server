@@ -13,6 +13,9 @@ const (
 	DataChunk           = 64 * 1024
 	MaxStreamID         = 0xFFFFFF
 	MaxBatchFrames      = 4096
+	// MaxOpenPayload bounds the client-named destination a tunnel profile
+	// accepts in OPEN: 253 bytes of hostname plus ':' and a five-digit port.
+	MaxOpenPayload = 300
 )
 
 type Type byte
@@ -120,7 +123,10 @@ func WindowPayload(amount uint32) []byte {
 	return result
 }
 
-func ValidateClientShape(value Frame) error {
+// ValidateClientShape checks a client-to-relay frame. Only a tunnel profile
+// takes a destination in OPEN, so the caller passes whether this session's
+// profile allows one.
+func ValidateClientShape(value Frame, allowOpenPayload bool) error {
 	if value.StreamID == 0 {
 		if value.Type != Pong || len(value.Payload) > 64 {
 			return fmt.Errorf("frame type %#x is invalid on stream zero", value.Type)
@@ -128,7 +134,14 @@ func ValidateClientShape(value Frame) error {
 		return nil
 	}
 	switch value.Type {
-	case Open, Close:
+	case Open:
+		if !allowOpenPayload && len(value.Payload) != 0 {
+			return fmt.Errorf("frame type %#x requires an empty payload", value.Type)
+		}
+		if len(value.Payload) > MaxOpenPayload {
+			return fmt.Errorf("OPEN payload exceeds %d bytes", MaxOpenPayload)
+		}
+	case Close:
 		if len(value.Payload) != 0 {
 			return fmt.Errorf("frame type %#x requires an empty payload", value.Type)
 		}

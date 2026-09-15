@@ -304,7 +304,7 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	frames, err := frame.ParseAll(body, s.limits.MaxFramePayload)
 	if err == nil {
 		for _, value := range frames {
-			if shapeErr := frame.ValidateClientShape(value); shapeErr != nil {
+			if shapeErr := frame.ValidateClientShape(value, s.allowsOpenPayload()); shapeErr != nil {
 				err = shapeErr
 				break
 			}
@@ -472,7 +472,7 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	frames, err := frame.ParseAll(body, s.limits.MaxFramePayload)
 	if err == nil {
 		for _, value := range frames {
-			if shapeErr := frame.ValidateClientShape(value); shapeErr != nil || value.StreamID != laneID {
+			if shapeErr := frame.ValidateClientShape(value, s.allowsOpenPayload()); shapeErr != nil || value.StreamID != laneID {
 				err = ErrProtocol
 				break
 			}
@@ -962,16 +962,23 @@ func (s *Session) applyBatchLocked(
 		case frame.Open:
 			if len(s.streams) >= s.limits.MaxStreamsPerSession ||
 				(s.acquireStream != nil && !s.acquireStream()) {
-				s.rememberClosedLocked(value.StreamID)
-				if s.onStreamRejected != nil {
-					s.onStreamRejected()
-				}
-				if !s.queueFrameLocked(frame.Close, value.StreamID, nil) {
+				if !s.rejectStreamLocked(value.StreamID) {
 					return opened, closed, reservedCost, reservedItems, false
 				}
 				continue
 			}
-			backend := newBackendStream(s, value.StreamID, s.profile.Backend)
+			address := s.profile.Backend
+			if s.allowsOpenPayload() {
+				destination, err := parseTunnelDestination(value.Payload)
+				if err != nil {
+					if !s.rejectStreamLocked(value.StreamID) {
+						return opened, closed, reservedCost, reservedItems, false
+					}
+					continue
+				}
+				address = destination
+			}
+			backend := newBackendStream(s, value.StreamID, address)
 			state = &streamState{
 				backend:       backend,
 				receiveWindow: frame.InitialStreamWindow,
@@ -1011,6 +1018,18 @@ func (s *Session) applyBatchLocked(
 		}
 	}
 	return opened, closed, reservedCost, reservedItems, true
+}
+
+// rejectStreamLocked refuses one stream without disturbing the session: the id
+// becomes a tombstone and the client is told to close it. A limit and a refused
+// tunnel destination share this path. It reports whether the CLOSE frame could
+// be queued.
+func (s *Session) rejectStreamLocked(id uint32) bool {
+	s.rememberClosedLocked(id)
+	if s.onStreamRejected != nil {
+		s.onStreamRejected()
+	}
+	return s.queueFrameLocked(frame.Close, id, nil)
 }
 
 func (s *Session) appendBackendWriteLocked(
@@ -1632,7 +1651,10 @@ func (s *backendStream) run() {
 	defer close(s.finished)
 	defer s.session.backendClosed(s.id, s)
 
-	dialer := net.Dialer{Timeout: s.session.timeouts.BackendDial.Value()}
+	dialer := net.Dialer{
+		Timeout: s.session.timeouts.BackendDial.Value(),
+		Control: s.session.tunnelDialControl(),
+	}
 	connection, err := dialer.DialContext(s.ctx, "tcp", s.address)
 	s.session.backendDialFinished(err != nil && s.ctx.Err() == nil)
 	if err != nil {

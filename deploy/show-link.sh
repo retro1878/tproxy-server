@@ -45,3 +45,22 @@ fi
 echo "Proxy server: $server"
 echo "Proxy secret: $proxy_secret"
 echo "Proxy link:   tg://webproxy?server=$server&secret=$proxy_secret"
+
+# The optional tunnel profile hands a client the hostname and its own secret, and
+# the client derives the bridge capability itself, so what an operator needs to
+# check is that the derived URL is the bridge rather than the public site. The
+# context label and the message shape are the ones the relay derives its
+# capability from; the same vectors are in PROTOCOL.md.
+tunnel_secret="$(sed -n 's/.*"kind"[[:space:]]*:[[:space:]]*"tunnel","secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$profiles" | head -n1)"
+if [[ -n "$tunnel_secret" ]]; then
+	if [[ -n "$base_path" ]]; then
+		message="tdesktop-web-proxy-bridge-v2\n$hostname\n$base_path"
+	else
+		message="tdesktop-web-proxy-bridge-v1\n$hostname"
+	fi
+	capability="$(printf '%b' "$message" |
+		openssl dgst -sha256 -mac HMAC -macopt "hexkey:$tunnel_secret" -binary |
+		base64 | tr '+/' '-_' | tr -d '=\n')"
+	echo "Tunnel secret: $tunnel_secret"
+	echo "Tunnel bridge: https://$server/?bridge=$capability"
+fi

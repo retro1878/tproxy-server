@@ -405,6 +405,36 @@ idempotent for a currently authenticated session. Tokens use the opaque signed
 representation described above. Missing or random credentials follow the public
 website; authentic but unusable credentials receive a local uncacheable 404.
 
+## Profile kinds
+
+A profile decides what an `OPEN` connects to.
+
+| Kind | Backend | `OPEN` payload |
+|---|---|---|
+| `mtproxy` (default) | the profile's fixed numeric loopback MTProxy | empty |
+| `tunnel` | the destination the client names | `host:port`, at most 300 bytes |
+
+An `mtproxy` profile carries Telegram only. Every stream dials the one configured
+MTProxy backend and the client cannot choose a destination, because the MTProxy
+transform the client applies can only be terminated by that MTProxy.
+
+A `tunnel` profile carries any TCP service. Each `OPEN` names its destination as
+`host:port`; the relay resolves it — so a client in a censored network never
+resolves the name itself — and then dials it. `host` is a DNS name or an IP
+literal, with brackets required for IPv6; the port is decimal, 1-65535. A
+destination that is malformed, or that the profile's policy refuses, closes that
+one stream and leaves the session and its other streams running, exactly as a
+per-session stream limit does. By default the relay refuses loopback, private
+(RFC 1918 and ULA), link-local, multicast, unspecified, and interface-local
+addresses, so a client cannot use the relay as a way into its own host or its
+private network; the profile's `allow_private_targets` lifts that and is only
+meaningful for a tunnel profile. The policy is applied to the **resolved**
+address, immediately before connect, so a name that resolves into a refused range
+is caught without a second resolution and without a rebinding window.
+
+Both kinds share the frame format, the carrier modes, the windows, and the
+session model. Only the dial target differs.
+
 ## Shared frames
 
 ```text
@@ -413,7 +443,7 @@ type:u8 | stream_id:u24 | payload_length:u32 | payload
 
 | Value | Name | Direction | Stream | Payload |
 |---:|---|---|---:|---|
-| `0x01` | `OPEN` | client → relay | nonzero | empty |
+| `0x01` | `OPEN` | client → relay | nonzero | empty, or the destination on a tunnel profile |
 | `0x02` | `DATA` | both | nonzero | opaque, nonempty |
 | `0x03` | `CLOSE` | both | nonzero | empty |
 | `0x04` | `WINDOW` | both | nonzero | nonzero `u32` delta |
@@ -429,8 +459,11 @@ The Telegram app, not the bridge JavaScript, prepares the shared frames:
 
 1. After the client boundary is authenticated, the client sends one
    `HELLO`. It may create streams only after receiving `WELCOME`.
-2. Each MTProxy TCP connection opened by the app becomes a new, never-reused
-   nonzero stream id and one `OPEN` frame.
+2. Each TCP connection the app opens becomes a new, never-reused nonzero stream
+   id and one `OPEN` frame. On an `mtproxy` profile the connection is already
+   transformed for MTProxy and the frame carries no payload; on a `tunnel`
+   profile the frame names the destination and the payload is carried
+   untransformed.
 3. Bytes already transformed for MTProxy become one or more `DATA` frames for that
    id. The client sends only within the relay-granted window.
 4. Relay `DATA` is written to the corresponding local app connection. As the local
@@ -470,9 +503,10 @@ WINDOW grants for one stream coalesce while pending even when other streams' con
 are interleaved. Backend reads pause when the downlink DATA partition is full and
 resume after a downlink acknowledgement releases capacity.
 
-An `OPEN` creates exactly one connection to the profile's configured numeric
-loopback backend. The client cannot select a destination. Stream IDs cannot be
-reused during a session. Up to 4096 recently closed IDs remain as tombstones so
+An `OPEN` creates exactly one connection: to the profile's configured numeric
+loopback MTProxy on an `mtproxy` profile, where the client cannot select a
+destination, or to the destination the frame named on a `tunnel` profile. Stream
+IDs cannot be reused during a session. Up to 4096 recently closed IDs remain as tombstones so
 well-formed late DATA, WINDOW, or CLOSE frames from a close race can be ignored.
 If an otherwise valid `OPEN` exceeds a per-session, profile, process-wide,
 dial-in-flight, or stream-creation-rate limit, the relay returns `CLOSE` for that

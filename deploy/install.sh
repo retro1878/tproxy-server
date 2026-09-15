@@ -14,9 +14,10 @@ mtproxy_max_connections=4096
 mtproxy_tag=
 carrier_mode=
 behind_cdn=
+tunnel_secret=
 
 usage() {
-	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex|random] [--mtproxy-workers 1] [--mtproxy-max-connections 4096] [--mtproxy-tag 32-hex] [--carrier-mode https|https-lanes|websocket|websocket-lanes] [--behind-cdn]" >&2
+	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex|random] [--tunnel-secret 32-or-34-hex|random] [--mtproxy-workers 1] [--mtproxy-max-connections 4096] [--mtproxy-tag 32-hex] [--carrier-mode https|https-lanes|websocket|websocket-lanes] [--behind-cdn]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
@@ -24,6 +25,7 @@ while [[ $# -gt 0 ]]; do
 		--hostname) hostname="${2:-}"; shift 2 ;;
 		--base-path) base_path="${2:-}"; shift 2 ;;
 		--secret) secret="${2:-}"; shift 2 ;;
+		--tunnel-secret) tunnel_secret="${2:-}"; shift 2 ;;
 		--email) email="${2:-}"; shift 2 ;;
 		--site-dir) site_dir="${2:-}"; shift 2 ;;
 		--site-upstream) site_upstream="${2:-}"; shift 2 ;;
@@ -59,6 +61,20 @@ fi
 if [[ -z "$secret" ]]; then
 	read -r -s -p "WEB proxy secret (32 hex, optionally prefixed with dd): " secret
 	echo
+fi
+# The tunnel profile is optional and carries its own secret: unlike a Telegram
+# client, a tunnel client is handed the hostname and this secret directly and
+# derives the bridge capability itself. It is read back out of the installed
+# file when the flag is absent for the same reason the mtproxy secret is:
+# profiles.json is rewritten on every run, so a reinstall that omitted the flag
+# would silently delete the profile and break every tunnel client at once.
+if [[ "$tunnel_secret" == random ]]; then
+	tunnel_secret="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d '[:space:]')"
+elif [[ -z "$tunnel_secret" ]] && [[ -f /etc/tproxy-server/profiles.json ]]; then
+	# This relies on the generated profile writing "kind" before "secret", which
+	# is what lets a single-line match find the tunnel secret and not the first
+	# profile's.
+	tunnel_secret="$(sed -n 's/.*"kind"[[:space:]]*:[[:space:]]*"tunnel","secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/tproxy-server/profiles.json | head -n1)"
 fi
 # A new deployment gets a fresh 128-bit slug, so its carrier stays off
 # well-known root paths by default. "none" selects the host root, which is what
@@ -100,6 +116,17 @@ if [[ ! "$hostname" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || [[ "$hostname" != 
 fi
 if [[ ! "$secret" =~ ^([0-9a-f]{32}|dd[0-9a-f]{32})$ ]]; then
 	echo "secret must be 32 lowercase hex characters, optionally prefixed with dd" >&2
+	exit 2
+fi
+if [[ -n "$tunnel_secret" ]] && [[ ! "$tunnel_secret" =~ ^([0-9a-f]{32}|dd[0-9a-f]{32})$ ]]; then
+	echo "tunnel secret must be 32 lowercase hex characters, optionally prefixed with dd" >&2
+	exit 2
+fi
+# Both profiles derive their capability from the same host and base path, so
+# identical secrets would produce the same capability and the relay would refuse
+# to start on a duplicate. Catch it here, before the profile file is written.
+if [[ -n "$tunnel_secret" ]] && [[ "$tunnel_secret" == "$secret" ]]; then
+	echo "the tunnel secret must differ from the mtproxy secret" >&2
 	exit 2
 fi
 if [[ ! "$email" =~ ^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
@@ -265,8 +292,23 @@ carrier_mode_field=
 if [[ -n "$carrier_mode" ]]; then
 	carrier_mode_field=",\"carrier_mode\":\"$carrier_mode\""
 fi
+# A tunnel profile dials the destination its client names in OPEN, so it has no
+# backend, and it carries the same carrier mode as the profile a Telegram client
+# uses - the transport is a property of the deployment, not the workload. "kind"
+# is written before "secret" so show-link.sh can find this secret unambiguously.
+tunnel_profile_field=
+if [[ -n "$tunnel_secret" ]]; then
+	tunnel_profile_field=",
+{\"name\":\"tunnel\",\"kind\":\"tunnel\",\"secret\":\"$tunnel_secret\"$carrier_mode_field}"
+fi
+# One profile per line. The scripts that read a secret back out of this file match
+# with a greedy sed, which over a single-line file returns the LAST secret in it -
+# so a second profile would otherwise be read as the first one's secret by both
+# the reinstall below and show-link.sh.
 cat > /etc/tproxy-server/profiles.json <<EOF
-{"profiles":[{"name":"default","secret":"$secret","backend":"127.0.0.1:2398"$carrier_mode_field}]}
+{"profiles":[
+{"name":"default","secret":"$secret","backend":"127.0.0.1:2398"$carrier_mode_field}$tunnel_profile_field
+]}
 EOF
 chown root:tproxy /etc/tproxy-server/config.json /etc/tproxy-server/profiles.json
 chmod 0640 /etc/tproxy-server/config.json

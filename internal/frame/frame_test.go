@@ -44,3 +44,29 @@ func TestRejectsExcessiveFrameCount(t *testing.T) {
 		t.Fatal("accepted excessive frame count")
 	}
 }
+
+func TestOpenPayloadShape(t *testing.T) {
+	destination := []byte("example.com:443")
+	if err := ValidateClientShape(Frame{Type: Open, StreamID: 1, Payload: destination}, true); err != nil {
+		t.Fatalf("a tunnel profile rejected a destination: %v", err)
+	}
+	if err := ValidateClientShape(Frame{Type: Open, StreamID: 1}, true); err != nil {
+		t.Fatalf("a tunnel profile rejected an empty OPEN: %v", err)
+	}
+	if err := ValidateClientShape(Frame{Type: Open, StreamID: 1, Payload: destination}, false); err == nil {
+		t.Fatal("an MTProxy profile accepted a destination in OPEN")
+	}
+	if err := ValidateClientShape(Frame{Type: Open, StreamID: 1, Payload: make([]byte, MaxOpenPayload+1)}, true); err == nil {
+		t.Fatal("an oversized OPEN payload was accepted")
+	}
+	// CLOSE stays empty for every profile, and the other types are unchanged.
+	if err := ValidateClientShape(Frame{Type: Close, StreamID: 1, Payload: destination}, true); err == nil {
+		t.Fatal("a CLOSE payload was accepted")
+	}
+	if err := ValidateClientShape(Frame{Type: Data, StreamID: 1, Payload: []byte("x")}, true); err != nil {
+		t.Fatalf("DATA was rejected: %v", err)
+	}
+	if err := ValidateClientShape(Frame{Type: Data, StreamID: 1}, true); err == nil {
+		t.Fatal("an empty DATA payload was accepted")
+	}
+}
