@@ -35,8 +35,13 @@ RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 CapabilityBoundingSet=
-IPAddressDeny=any
-IPAddressAllow=localhost
+# A tunnel profile dials the destination its client names, which is on the
+# public internet, so the relay can no longer be confined to loopback. What it
+# must still never reach is the host's own private network, the link-local
+# ranges, and cloud metadata - which is also what the relay refuses before it
+# dials a client-named address. Denying only those keeps that as a kernel-level
+# backstop instead of a promise the Go policy makes on its own.
+IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 UMask=0077
