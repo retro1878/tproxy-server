@@ -51,6 +51,8 @@ type streamState struct {
 	backend           *backendStream
 	receiveWindow     uint32
 	sendCredit        uint64
+	bytesUp           uint64
+	bytesDown         uint64
 	pendingWriteBytes int
 	pendingWriteCost  int
 	pendingWriteItems int
@@ -1024,6 +1026,7 @@ func (s *Session) applyBatchLocked(
 			reservedCost -= cost
 			reservedItems -= items
 			state.receiveWindow -= uint32(len(value.Payload))
+			state.bytesUp += uint64(len(value.Payload))
 			signal(state.writeNotify)
 		case frame.Window:
 			if wasClosed {
@@ -1039,6 +1042,8 @@ func (s *Session) applyBatchLocked(
 			if wasClosed {
 				continue
 			}
+			log.Printf("stream %d closed by the client after %d bytes up and %d down",
+				value.StreamID, state.bytesUp, state.bytesDown)
 			s.releaseStreamWritesLocked(state)
 			delete(s.streams, value.StreamID)
 			s.rememberClosedLocked(value.StreamID)
@@ -1188,6 +1193,7 @@ func (s *Session) backendData(id uint32, data []byte) bool {
 		return false
 	}
 	state.sendCredit -= uint64(len(data))
+	state.bytesDown += uint64(len(data))
 	if !s.queueFrameLocked(frame.Data, id, data) {
 		return false
 	}
@@ -1195,9 +1201,11 @@ func (s *Session) backendData(id uint32, data []byte) bool {
 }
 
 func (s *Session) backendClosed(id uint32, backend *backendStream) {
+	var up, down uint64
 	s.mu.Lock()
 	state := s.streams[id]
 	if !s.closed && state != nil && state.backend == backend {
+		up, down = state.bytesUp, state.bytesDown
 		s.releaseStreamWritesLocked(state)
 		delete(s.streams, id)
 		s.rememberClosedLocked(id)
@@ -1206,6 +1214,13 @@ func (s *Session) backendClosed(id uint32, backend *backendStream) {
 		}
 	}
 	s.mu.Unlock()
+	// A stream the client closed is already gone from the table, so reaching
+	// here with a reason means the far end ended it. That is otherwise entirely
+	// invisible: the client is told only that its stream closed.
+	if backend.endReason != "" {
+		log.Printf("stream %d closed after %d bytes up and %d down: %s",
+			id, up, down, backend.endReason)
+	}
 	backend.close()
 }
 
@@ -1665,6 +1680,9 @@ type backendStream struct {
 	conn      net.Conn
 	closeOnce sync.Once
 	finished  chan struct{}
+	// endReason is written by this stream's own read loop and read once that
+	// loop has returned, so it needs no further protection.
+	endReason string
 }
 
 func newBackendStream(session *Session, id uint32, address string) *backendStream {
@@ -1741,19 +1759,27 @@ func (s *backendStream) readLoop(connection net.Conn) {
 	for {
 		allowance, ok := s.session.nextReadAllowance(s.id, s.ctx.Done())
 		if !ok {
+			s.endReason = "the stream was cancelled"
 			return
 		}
 		read, err := connection.Read(buffer[:allowance])
 		if read > 0 && !s.session.backendData(s.id, buffer[:read]) {
+			s.endReason = "the session stopped taking bytes"
 			return
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) && s.ctx.Err() == nil {
-				return
+			switch {
+			case errors.Is(err, io.EOF):
+				s.endReason = "the destination closed"
+			case s.ctx.Err() != nil:
+				s.endReason = "the stream was cancelled"
+			default:
+				s.endReason = "the destination failed: " + err.Error()
 			}
 			return
 		}
 		if read == 0 {
+			s.endReason = "the destination sent nothing"
 			return
 		}
 	}
