@@ -186,6 +186,61 @@ func TestBridgeLimitFailsLocally(t *testing.T) {
 
 }
 
+// A carrier batch arrives only as fast as the client's uplink allows, and the
+// relay reads it at that speed because Caddy streams the body through. So a body
+// that is still arriving must not be cut off for taking a while: the deadline
+// bounds a body that has stopped moving, not one that is merely slow.
+func TestSlowButProgressingUplinkBodyIsAccepted(t *testing.T) {
+	backend := startEchoBackend(t)
+	application, _ := newTestServer(t, backend)
+	application.bodyReadDeadline = 300 * time.Millisecond
+	defer application.Shutdown()
+	hosted := httptest.NewServer(application.Handler())
+	defer hosted.Close()
+
+	bootstrap, err := application.manager.IssueBootstrap(
+		&application.config.Profiles[0], "198.51.100.11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := apiRequest(t, http.MethodPost, hosted.URL+"/api/v1/session", bootstrap,
+		frame.Encode(frame.Hello, 0, []byte{1}))
+	create.Header.Set("X-Forwarded-For", "198.51.100.11")
+	created := perform(t, hosted.Client(), create)
+	_ = readResponse(t, created)
+	if created.StatusCode != http.StatusOK {
+		t.Fatalf("session creation failed: %d", created.StatusCode)
+	}
+
+	// Ten frames, each well inside the deadline, together taking longer than it.
+	reader, writer := io.Pipe()
+	request, err := http.NewRequest(http.MethodPost, hosted.URL+"/api/v1/up", reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Host = testHost
+	request.ContentLength = -1
+	request.Header.Set("X-Forwarded-For", "198.51.100.11")
+	request.Header.Set("Authorization", "Bearer "+created.Header.Get("X-Session-Token"))
+	request.Header.Set("Content-Type", "application/octet-stream")
+	request.Header.Set("X-Up-Seq", "1")
+	go func() {
+		defer writer.Close()
+		for index := 0; index < 10; index++ {
+			if _, err := writer.Write(frame.Encode(frame.Pong, 0, []byte("x"))); err != nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	response := perform(t, hosted.Client(), request)
+	_ = readResponse(t, response)
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("a batch that was still arriving was refused: %d", response.StatusCode)
+	}
+}
+
 func TestSessionCreateAuthenticatesBeforeReadingBody(t *testing.T) {
 	backend := startEchoBackend(t)
 	application, _ := newTestServer(t, backend)
