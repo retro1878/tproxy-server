@@ -38,6 +38,9 @@ const maxCreateBodyBytes = 64
 // Caddy->relay connection open indefinitely — neither while a handler reads
 // it nor while net/http discards an unread body before answering. Long polls
 // carry no body. Public requests use the ordinary gateway timeout policy.
+//
+// This is how long a body may go without progress, not how long it may take:
+// see bodyProgress.
 const bodyReadDeadline = 30 * time.Second
 
 type Server struct {
@@ -259,7 +262,7 @@ func (s *Server) serveSession(
 		s.serveNotFound(w, r)
 		return
 	}
-	body, err := readBody(w, r, maxCreateBodyBytes)
+	body, err := s.readBody(w, r, maxCreateBodyBytes)
 	if err != nil {
 		s.serveNotFound(w, r)
 		return
@@ -300,7 +303,7 @@ func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 		s.serveNotFound(w, r)
 		return
 	}
-	body, err := readBody(w, r, s.config.Limits.MaxBodyBytes)
+	body, err := s.readBody(w, r, s.config.Limits.MaxBodyBytes)
 	if err != nil {
 		log.Printf("uplink body rejected: %v", err)
 		s.serveNotFound(w, r)
@@ -740,10 +743,34 @@ func (s *Server) setReadDeadline(w http.ResponseWriter) {
 	}
 }
 
-func readBody(w http.ResponseWriter, r *http.Request, limit int) ([]byte, error) {
+// bodyProgress re-arms the request's read deadline whenever the body moves.
+//
+// The deadline exists so a body cannot hold a relay goroutine and a
+// Caddy->relay connection open indefinitely, but armed once for the whole body
+// it also fails a body that is merely slow. A carrier batch is bounded only by
+// the client's uplink: Caddy streams the body through as the browser sends it,
+// so the relay reads at whatever that uplink manages, which on a slow link is
+// less than a batch per deadline. Re-arming on progress keeps the protection
+// and drops the false failure: a body that has stopped moving is still cut.
+type bodyProgress struct {
+	reader io.Reader
+	extend func()
+}
+
+func (b *bodyProgress) Read(p []byte) (int, error) {
+	read, err := b.reader.Read(p)
+	if read > 0 {
+		b.extend()
+	}
+	return read, err
+}
+
+func (s *Server) readBody(w http.ResponseWriter, r *http.Request, limit int) ([]byte, error) {
 	reader := http.MaxBytesReader(w, r.Body, int64(limit))
 	defer reader.Close()
-	result, err := io.ReadAll(reader)
+	extend := func() { s.setReadDeadline(w) }
+	extend()
+	result, err := io.ReadAll(&bodyProgress{reader: reader, extend: extend})
 	if err != nil {
 		// A rejected body is a 404 with no other explanation, so it says how
 		// much arrived and what the request claimed, which is what tells an
