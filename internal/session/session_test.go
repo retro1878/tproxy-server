@@ -14,6 +14,58 @@ import (
 	"github.com/telegramdesktop/tproxy-server/internal/frame"
 )
 
+// A client keeps several uplink batches in flight, and the relay answers each
+// when it arrives rather than when it is applied. So a batch can be acknowledged
+// while the batches before it are still being parsed: the client is entitled to
+// dispatch the next one then, with the applied watermark behind it.
+func TestAcceptedButUnappliedBatchesDoNotEndTheSession(t *testing.T) {
+	manager, token, value := testSession(t)
+	defer manager.Shutdown()
+
+	window := value.limits.MaxPipelinedUpBatches
+	keepAlive := frame.Encode(frame.Pong, 0, []byte("x"))
+
+	// The later batches are parsed first, as happens when several arrive
+	// together, so they park with the watermark where it started.
+	for sequence := 2; sequence <= window; sequence++ {
+		if _, err := value.ProcessUp(uint64(sequence), keepAlive); err != nil {
+			t.Fatalf("batch %d was refused: %v", sequence, err)
+		}
+	}
+	// Those arrivals were answered, so the client dispatches the next batch.
+	if _, err := value.ProcessUp(uint64(window)+1, keepAlive); err != nil {
+		t.Fatalf("a batch within the client's in-flight window was refused: %v", err)
+	}
+	if _, err := manager.Get(token); err != nil {
+		t.Fatalf("the session was closed: %v", err)
+	}
+}
+
+// The sequence bound has to stay finite for a client that sends cheap frames, so
+// the reorder buffer is capped - and a client that reaches the cap is asked to
+// slow down rather than having its session killed.
+func TestTooManyParkedBatchesAreBackpressureNotAFault(t *testing.T) {
+	manager, token, value := testSession(t)
+	defer manager.Shutdown()
+
+	window := value.limits.MaxPipelinedUpBatches
+	keepAlive := frame.Encode(frame.Pong, 0, []byte("x"))
+
+	var err error
+	for sequence := 2; sequence <= 2*window+2; sequence++ {
+		_, err = value.ProcessUp(uint64(sequence), keepAlive)
+		if err != nil {
+			break
+		}
+	}
+	if !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("filling the reorder buffer gave %v, want ErrBackpressure", err)
+	}
+	if _, err := manager.Get(token); err != nil {
+		t.Fatalf("filling the reorder buffer closed the session: %v", err)
+	}
+}
+
 func TestSequenceRetryAndMismatch(t *testing.T) {
 	manager, token, value := testSession(t)
 	defer manager.Shutdown()

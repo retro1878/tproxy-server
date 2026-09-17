@@ -130,6 +130,7 @@ type Session struct {
 	unackedBase           uint64
 	downCursor            uint64
 	lastUpSequence        uint64
+	lastUpAccepted        uint64
 	upPendingBatches      map[uint64]*pendingUpBatch
 	upAppliedDigests      map[uint64][sha256.Size]byte
 	upAppliedOrder        []uint64
@@ -272,7 +273,15 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		return 0, ErrClosed
 	}
 	s.lastActivity = time.Now()
-	if sequence == 0 || sequence > s.lastUpSequence+uint64(s.limits.MaxPipelinedUpBatches) {
+	// A client may keep MaxPipelinedUpBatches uplink batches in flight, and each
+	// is answered when it arrives rather than when it is applied, so the highest
+	// sequence a client can legitimately send is measured from the highest one
+	// already accepted. Measuring it from the applied watermark instead fails a
+	// client that is behaving correctly: several batches are parsed at once, so
+	// a late one can be acknowledged while the earlier ones are still parsing,
+	// and the client - having been told it arrived - dispatches the next batch
+	// with the watermark still behind it.
+	if sequence == 0 || sequence > s.lastUpAccepted+uint64(s.limits.MaxPipelinedUpBatches) {
 		s.mu.Unlock()
 		s.protocolFailure()
 		return 0, ErrProtocol
@@ -348,12 +357,23 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		s.mu.Unlock()
 		return 0, ErrBackpressure
 	}
+	// What the sequence bound above allows has to be finite for a client that
+	// sends cheap frames, so the reorder buffer is capped here. It holds at most
+	// two windows: one that the client may have in flight, and one that may have
+	// been accepted and not yet applied.
+	if len(s.upPendingBatches) >= 2*s.limits.MaxPipelinedUpBatches {
+		s.mu.Unlock()
+		return 0, ErrBackpressure
+	}
 	s.upPendingBatches[sequence] = &pendingUpBatch{
 		frames:        frames,
 		size:          len(body),
 		digest:        digest,
 		reservedCost:  reservedCost,
 		reservedItems: reservedItems,
+	}
+	if sequence > s.lastUpAccepted {
+		s.lastUpAccepted = sequence
 	}
 	opened, closed, appliedBytes, drainErr := s.drainUpLocked()
 	s.mu.Unlock()

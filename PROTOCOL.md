@@ -266,13 +266,23 @@ applied. The bridge retries the same sequence with the byte-identical body after
 honouring `Retry-After` (a fixed retry count never applies to 503; a 90-second budget
 does).
 
-A sequence more than `max_pipelined_up_batches` ahead of the committed sequence is a
-protocol error and closes the session, which is what bounds the relay's reorder buffer
-alongside the queue budget. A committed sequence is accepted again only when the body
-is byte-identical to the one committed for it; the relay remembers the digests of the
-last `max_pipelined_up_batches + 1` committed sequences so a retry that is no longer
-the newest one is still verified rather than trusted. Setting
-`max_pipelined_up_batches` to `1` restores strictly serialized uplink requests.
+A sequence more than `max_pipelined_up_batches` ahead of the highest sequence the relay
+has **accepted** is a protocol error and closes the session. The bound is measured from
+acceptance rather than from the committed watermark, because a batch is acknowledged when
+it arrives and applied later: several batches are parsed at once, so a later one can be
+acknowledged while the batches before it are still being parsed, and a client that was
+told it arrived dispatches the next batch with the watermark still behind it. Measuring
+from the committed watermark fails exactly the client that is behaving correctly.
+
+What bounds the relay's reorder buffer is therefore the buffer itself: it holds at most
+two windows of parked batches, and beyond that the relay answers `503` rather than
+closing the session, so a client sending cheap frames is asked to slow down instead of
+being disconnected. The queue budget bounds the memory those batches charge. A committed
+sequence is accepted again only when the body is byte-identical to the one committed for
+it; the relay remembers the digests of the last `max_pipelined_up_batches + 1` committed
+sequences so a retry that is no longer the newest one is still verified rather than
+trusted. Setting `max_pipelined_up_batches` to `1` restores strictly serialized uplink
+requests.
 
 One downlink poll is active at a time and the newest poll wins: when a poll arrives
 while another one is parked (typically because the older connection died silently),
