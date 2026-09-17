@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net"
 	"net/http"
@@ -301,6 +302,7 @@ func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 	}
 	body, err := readBody(w, r, s.config.Limits.MaxBodyBytes)
 	if err != nil {
+		log.Printf("uplink body rejected: %v", err)
 		s.serveNotFound(w, r)
 		return
 	}
@@ -331,6 +333,7 @@ func (s *Server) serveUp(w http.ResponseWriter, r *http.Request, token string) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		log.Printf("uplink rejected: %v", err)
 		s.serveNotFound(w, r)
 		return
 	}
@@ -392,6 +395,7 @@ func (s *Server) serveDown(w http.ResponseWriter, r *http.Request, token string)
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		log.Printf("downlink rejected: %v", err)
 		s.serveNotFound(w, r)
 		return
 	}

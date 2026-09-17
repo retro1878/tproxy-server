@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"math"
 	"net"
 	"sync"
@@ -282,15 +284,16 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	// and the client - having been told it arrived - dispatches the next batch
 	// with the watermark still behind it.
 	if sequence == 0 || sequence > s.lastUpAccepted+uint64(s.limits.MaxPipelinedUpBatches) {
+		ahead := s.lastUpAccepted + uint64(s.limits.MaxPipelinedUpBatches)
 		s.mu.Unlock()
-		s.protocolFailure()
+		s.protocolFailure(fmt.Sprintf("uplink sequence %d is beyond the window ending at %d", sequence, ahead))
 		return 0, ErrProtocol
 	}
 	if sequence <= s.lastUpSequence {
 		match := s.replayUpLocked(sequence, digest)
 		s.mu.Unlock()
 		if !match {
-			s.protocolFailure()
+			s.protocolFailure(fmt.Sprintf("uplink sequence %d was resent with different bytes", sequence))
 			return 0, ErrProtocol
 		}
 		return sequence, nil
@@ -298,7 +301,7 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	if parked, ok := s.upPendingBatches[sequence]; ok {
 		s.mu.Unlock()
 		if !bytes.Equal(digest[:], parked.digest[:]) {
-			s.protocolFailure()
+			s.protocolFailure(fmt.Sprintf("parked uplink sequence %d arrived with different bytes", sequence))
 			return 0, ErrProtocol
 		}
 		return sequence, nil
@@ -328,7 +331,7 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	}
 	if err != nil {
 		s.mu.Unlock()
-		s.protocolFailure()
+		s.protocolFailure(fmt.Sprintf("uplink batch %d is malformed: %v", sequence, err))
 		return 0, ErrProtocol
 	}
 	// The watermark can move while the body is parsed, so an arrival is
@@ -338,7 +341,7 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		match := s.replayUpLocked(sequence, digest)
 		s.mu.Unlock()
 		if !match {
-			s.protocolFailure()
+			s.protocolFailure(fmt.Sprintf("uplink sequence %d was resent with different bytes", sequence))
 			return 0, ErrProtocol
 		}
 		return sequence, nil
@@ -346,7 +349,7 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	if parked, ok := s.upPendingBatches[sequence]; ok {
 		s.mu.Unlock()
 		if !bytes.Equal(digest[:], parked.digest[:]) {
-			s.protocolFailure()
+			s.protocolFailure(fmt.Sprintf("parked uplink sequence %d arrived with different bytes", sequence))
 			return 0, ErrProtocol
 		}
 		return sequence, nil
@@ -388,7 +391,7 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		if errors.Is(drainErr, ErrClosed) {
 			s.Close()
 		} else {
-			s.protocolFailure()
+			s.protocolFailure(fmt.Sprintf("applying uplink batch %d failed: %v", sequence, drainErr))
 		}
 		return 0, drainErr
 	}
@@ -499,7 +502,7 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 		}
 	}
 	if err != nil {
-		s.laneProtocolFailure(laneID)
+		s.laneProtocolFailure(laneID, fmt.Sprintf("batch %d is malformed or belongs to another lane", sequence))
 		return 0, ErrProtocol
 	}
 
@@ -523,7 +526,7 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 		}
 		if laneID == 0 || len(frames) == 0 || frames[0].Type != frame.Open {
 			s.mu.Unlock()
-			s.laneProtocolFailure(laneID)
+			s.laneProtocolFailure(laneID, "a lane must begin with OPEN")
 			return 0, ErrProtocol
 		}
 		lane = newCarrierLane()
@@ -534,14 +537,15 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 		match := bytes.Equal(digest[:], lane.lastUpDigest[:])
 		s.mu.Unlock()
 		if !match {
-			s.laneProtocolFailure(laneID)
+			s.laneProtocolFailure(laneID, fmt.Sprintf("sequence %d was resent with different bytes", sequence))
 			return 0, ErrProtocol
 		}
 		return sequence, nil
 	}
 	if sequence != lane.lastUpSequence+1 || sequence == 0 {
+		wanted := lane.lastUpSequence + 1
 		s.mu.Unlock()
-		s.laneProtocolFailure(laneID)
+		s.laneProtocolFailure(laneID, fmt.Sprintf("sequence %d does not follow %d", sequence, wanted))
 		return 0, ErrProtocol
 	}
 	if lane.upActive {
@@ -552,7 +556,7 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	if !s.validateBatchLocked(frames) {
 		lane.upActive = false
 		s.mu.Unlock()
-		s.laneProtocolFailure(laneID)
+		s.laneProtocolFailure(laneID, fmt.Sprintf("batch %d is invalid for this lane's streams", sequence))
 		return 0, ErrProtocol
 	}
 	reservedCost, reservedItems := s.backendWriteReservationLocked(frames)
@@ -614,8 +618,9 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 			return result, next, nil
 		}
 		if cursor != s.downCursor {
+			wanted := s.downCursor
 			s.mu.Unlock()
-			s.protocolFailure()
+			s.protocolFailure(fmt.Sprintf("downlink cursor %d does not follow %d while a batch is outstanding", cursor, wanted))
 			return nil, cursor, ErrProtocol
 		}
 		s.releasePendingLocked(s.unackedCost, s.unackedItems)
@@ -623,8 +628,9 @@ func (s *Session) Poll(ctx context.Context, cursor uint64) ([]byte, uint64, erro
 		s.unackedCost = 0
 		s.unackedItems = 0
 	} else if cursor != s.downCursor {
+		wanted := s.downCursor
 		s.mu.Unlock()
-		s.protocolFailure()
+		s.protocolFailure(fmt.Sprintf("downlink cursor %d does not follow %d", cursor, wanted))
 		return nil, cursor, ErrProtocol
 	}
 	// Newest poll wins: a poll arriving while another one is parked (its
@@ -731,8 +737,9 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 			return result, next, false, nil
 		}
 		if cursor != lane.downCursor {
+			wanted := lane.downCursor
 			s.mu.Unlock()
-			s.laneProtocolFailure(laneID)
+			s.laneProtocolFailure(laneID, fmt.Sprintf("downlink cursor %d does not follow %d while a batch is outstanding", cursor, wanted))
 			return nil, cursor, false, ErrProtocol
 		}
 		s.releasePendingLocked(lane.unackedCost, lane.unackedItems)
@@ -740,8 +747,9 @@ func (s *Session) PollLane(ctx context.Context, laneID uint32, cursor uint64) ([
 		lane.unackedCost = 0
 		lane.unackedItems = 0
 	} else if cursor != lane.downCursor {
+		wanted := lane.downCursor
 		s.mu.Unlock()
-		s.laneProtocolFailure(laneID)
+		s.laneProtocolFailure(laneID, fmt.Sprintf("downlink cursor %d does not follow %d", cursor, wanted))
 		return nil, cursor, false, ErrProtocol
 	}
 	if lane.downActive && lane.superseded != nil {
@@ -1567,17 +1575,21 @@ func (s *Session) releasePendingLocked(cost, items int) {
 	s.budgetNotify = make(chan struct{})
 }
 
-func (s *Session) protocolFailure() {
+// protocolFailure closes the session and every stream on it. It says why: a
+// closed session is otherwise indistinguishable from the outside, because the
+// carriers answer a protocol error with an uncacheable 404 and nothing else.
+func (s *Session) protocolFailure(reason string) {
+	log.Printf("session %s closed: %s", s.clientIP, reason)
 	s.mu.Lock()
 	s.closeLocked()
 	s.mu.Unlock()
 }
 
-func (s *Session) laneProtocolFailure(laneID uint32) {
+func (s *Session) laneProtocolFailure(laneID uint32, reason string) {
 	if s.carrier == config.CarrierWebSocketLanes {
 		s.ReleaseWebSocketLane(laneID)
 	} else {
-		s.protocolFailure()
+		s.protocolFailure(fmt.Sprintf("lane %d: %s", laneID, reason))
 	}
 }
 
