@@ -744,8 +744,15 @@ func readBody(w http.ResponseWriter, r *http.Request, limit int) ([]byte, error)
 	reader := http.MaxBytesReader(w, r.Body, int64(limit))
 	defer reader.Close()
 	result, err := io.ReadAll(reader)
-	if err != nil || len(result) == 0 {
-		return nil, errors.New("invalid body")
+	if err != nil {
+		// A rejected body is a 404 with no other explanation, so it says how
+		// much arrived and what the request claimed, which is what tells an
+		// oversized batch from a truncated one.
+		return nil, fmt.Errorf("body unreadable within %d bytes, %d arrived (content-length %d): %w",
+			limit, len(result), r.ContentLength, err)
+	}
+	if len(result) == 0 {
+		return nil, fmt.Errorf("body is empty (content-length %d)", r.ContentLength)
 	}
 	return result, nil
 }
