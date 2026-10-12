@@ -41,7 +41,12 @@ CapabilityBoundingSet=
 # ranges, and cloud metadata - which is also what the relay refuses before it
 # dials a client-named address. Denying only those keeps that as a kernel-level
 # backstop instead of a promise the Go policy makes on its own.
-IPAddressDeny=10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 fc00::/7 fe80::/10
+# 100.64.0.0/10 is the gap the Go policy leaves: it is CGNAT space, so
+# net.IP.IsPrivate() is false for it and 100.100.100.200 - Alibaba Cloud's
+# metadata endpoint - is admitted by the policy and by everything else here.
+# 0.0.0.0/8 is denied by the policy already (IsUnspecified); it is listed so
+# the kernel backstop does not depend on that staying true.
+IPAddressDeny=10.0.0.0/8 100.64.0.0/10 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 0.0.0.0/8 fc00::/7 fe80::/10
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 UMask=0077

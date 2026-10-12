@@ -69,6 +69,20 @@ fi
 # profiles.json is rewritten on every run, so a reinstall that omitted the flag
 # would silently delete the profile and break every tunnel client at once.
 if [[ "$tunnel_secret" == random ]]; then
+	# profiles.json is rewritten on every run, so drawing a fresh secret here
+	# would replace the one every tunnel client already derives its capability
+	# from, and break all of them at once. The mtproxy secret takes "random"
+	# only when the host has none; the tunnel secret does the same, because the
+	# flag has to be given on every run for the profile to survive at all.
+	installed_tunnel_secret=""
+	if [[ -f /etc/tproxy-server/profiles.json ]]; then
+		installed_tunnel_secret="$(sed -n 's/.*"kind"[[:space:]]*:[[:space:]]*"tunnel","secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/tproxy-server/profiles.json | head -n1)"
+	fi
+	if [[ -n "$installed_tunnel_secret" ]]; then
+		echo "this host already serves a tunnel profile; refusing to draw a new tunnel secret." >&2
+		echo "omit --tunnel-secret to keep it, or pass the current secret to rotate it deliberately." >&2
+		exit 2
+	fi
 	tunnel_secret="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d '[:space:]')"
 elif [[ -z "$tunnel_secret" ]] && [[ -f /etc/tproxy-server/profiles.json ]]; then
 	# This relies on the generated profile writing "kind" before "secret", which
