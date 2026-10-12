@@ -435,8 +435,8 @@ reverse_proxy 127.0.0.1:8080 {
 Do not route either static files or a site application around the relay on this
 hostname. The relay must remain the one gateway so that encoding, response
 headers, method handling, and reverse-proxy-hop timing do not expose a separate
-transport surface. Set the server `timeouts` as in `deploy/Caddyfile` (`read_body`
-well above `long_poll`).
+transport surface. Set the server `timeouts` as in `deploy/Caddyfile`
+(`read_body_idle`, and no `read_body`, which is a hard limit on the whole upload).
 
 The relay must receive the original `Host`. The supplied direct-to-origin Caddy
 layout relies on Caddy's default sanitizing of forwarded client addresses; if you

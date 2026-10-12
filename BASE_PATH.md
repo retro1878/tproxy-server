@@ -311,8 +311,11 @@ example.com {
 }
 ```
 
-Keep the global `servers.timeouts.read_body` well above the relay's `long_poll`,
-as in `deploy/Caddyfile`.
+Set `servers.timeouts.read_body_idle` as in `deploy/Caddyfile`, and leave
+`read_body` unset. `read_body` is a hard limit on the whole upload rather than an
+inactivity bound, so setting one cuts a carrier batch that is still arriving on a
+slow uplink — the case the relay's own progress-resetting body deadline exists to
+allow. Long polls carry no request body, so their budget is not at risk here.
 
 ## 5. Rolling out on a domain you already own
 

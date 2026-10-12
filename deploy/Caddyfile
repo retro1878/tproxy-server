@@ -9,12 +9,17 @@
 		# answers 404 to the bridge and the API, which reads as the proxy
 		# silently dying. Behind a CDN the field is meaningless anyway, since
 		# Caddy would only ever be naming the edge, never the user.
-		# read_body maps to Go's ReadTimeout; it must stay well above the
-		# relay's long_poll (25s) so parked polls are never cut, while still
-		# bounding a slow-body client at this hop too.
+		# read_body is a hard limit on the whole upload, so setting one caps a
+		# carrier batch that is still arriving on a slow uplink - which is the
+		# case the relay's own progress-resetting body deadline exists to allow.
+		# read_body_idle is the bound that fits: it resets after every successful
+		# read, so a client that keeps sending is not cut, while a stalled upload
+		# still is. It does not stop a client that trickles just enough to never
+		# stall, since the relay's own body deadline resets on progress too; add
+		# a min_rate here if that becomes a problem in practice.
 		timeouts {
 			read_header 10s
-			read_body 60s
+			read_body_idle 60s
 		}
 	}
 }
