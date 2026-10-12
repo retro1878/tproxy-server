@@ -41,28 +41,47 @@ func TestAcceptedButUnappliedBatchesDoNotEndTheSession(t *testing.T) {
 	}
 }
 
-// The sequence bound has to stay finite for a client that sends cheap frames, so
-// the reorder buffer is capped - and a client that reaches the cap is asked to
-// slow down rather than having its session killed.
-func TestTooManyParkedBatchesAreBackpressureNotAFault(t *testing.T) {
+// A batch refused by the reorder-buffer cap must not leave its reservation
+// behind. The reservation is taken before the cap is checked, so a batch that
+// trips the cap on arrival is charged for something that is never parked and
+// never applied; nothing returns it except closing the session.
+func TestRefusedBatchLeavesNoReservationBehind(t *testing.T) {
 	manager, token, value := testSession(t)
 	defer manager.Shutdown()
 
 	window := value.limits.MaxPipelinedUpBatches
 	keepAlive := frame.Encode(frame.Pong, 0, []byte("x"))
+	payload := frame.Encode(frame.Data, 1, []byte("payload"))
 
-	var err error
-	for sequence := 2; sequence <= 2*window+2; sequence++ {
-		_, err = value.ProcessUp(uint64(sequence), keepAlive)
-		if err != nil {
-			break
+	// Park batches above the gap without sending the sequence they wait on. The
+	// cap is 2*window and the first sequence is held back, so the highest that
+	// still parks is 2*window.
+	for sequence := uint64(2); sequence <= uint64(2*window)+1; sequence++ {
+		if _, err := value.ProcessUp(sequence, keepAlive); err != nil {
+			t.Fatalf("parking sequence %d failed: %v", sequence, err)
 		}
 	}
-	if !errors.Is(err, ErrBackpressure) {
-		t.Fatalf("filling the reorder buffer gave %v, want ErrBackpressure", err)
+	if got, want := len(value.upPendingBatches), 2*window; got != want {
+		t.Fatalf("setup parked %d batches, want %d", got, want)
+	}
+
+	before := manager.Capacity()
+
+	// The buffer is at its cap, so this arrival is refused by the cap.
+	if _, err := value.ProcessUp(1, payload); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("a batch over the reorder-buffer cap gave %v, want ErrBackpressure", err)
+	}
+
+	// The refused batch was never parked, so it must not be charged. Its bytes
+	// would only come back when the session closes.
+	after := manager.Capacity()
+	if after.PendingBytes != before.PendingBytes || after.PendingItems != before.PendingItems {
+		t.Fatalf("a refused batch left %d bytes and %d items charged, want none (had %d and %d)",
+			after.PendingBytes-before.PendingBytes, after.PendingItems-before.PendingItems,
+			before.PendingBytes, before.PendingItems)
 	}
 	if _, err := manager.Get(token); err != nil {
-		t.Fatalf("filling the reorder buffer closed the session: %v", err)
+		t.Fatalf("a refused batch closed the session: %v", err)
 	}
 }
 

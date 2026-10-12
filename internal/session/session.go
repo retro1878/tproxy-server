@@ -356,17 +356,19 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 		}
 		return sequence, nil
 	}
-	reservedCost, reservedItems := pendingUpReservation(frames)
-	if (reservedCost != 0 || reservedItems != 0) &&
-		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
-		s.mu.Unlock()
-		return 0, ErrBackpressure
-	}
 	// What the sequence bound above allows has to be finite for a client that
 	// sends cheap frames, so the reorder buffer is capped here. It holds at most
 	// two windows: one that the client may have in flight, and one that may have
-	// been accepted and not yet applied.
+	// been accepted and not yet applied. The cap is checked before the reservation
+	// below is taken: a batch refused here is never parked and never applied, so a
+	// reservation taken first would only be returned when the session closes.
 	if len(s.upPendingBatches) >= 2*s.limits.MaxPipelinedUpBatches {
+		s.mu.Unlock()
+		return 0, ErrBackpressure
+	}
+	reservedCost, reservedItems := pendingUpReservation(frames)
+	if (reservedCost != 0 || reservedItems != 0) &&
+		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink) {
 		s.mu.Unlock()
 		return 0, ErrBackpressure
 	}
