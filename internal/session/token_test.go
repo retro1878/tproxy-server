@@ -1,6 +1,8 @@
 package session
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"testing"
 	"time"
@@ -61,5 +63,43 @@ func TestTokenProvenanceSurvivesExpiryAndRestart(t *testing.T) {
 	}
 	if _, err := restarted.Create(bootstrap, "127.0.0.1", frame.Encode(frame.Hello, 0, []byte{1})); err == nil {
 		t.Fatal("authentic but missing bootstrap authorized after restart")
+	}
+}
+
+// A failed update restores the previous release, which draws all 16 nonce
+// bytes at random and knows no filter tag. It must still recognize tokens
+// issued by this release, or their carrier requests reach the website.
+func TestPreviousReleaseRecognizesTaggedTokens(t *testing.T) {
+	value := config.Defaults()
+	value.Profiles = []config.Profile{{Name: "test", Capability: [32]byte{2}, Backend: "127.0.0.1:1"}}
+	key := [32]byte{1}
+	manager := NewManager(value, key)
+	defer manager.Shutdown()
+	bootstrap, err := manager.IssueBootstrap(&value.Profiles[0], "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := manager.Create(bootstrap, "127.0.0.1", frame.Encode(frame.Hello, 0, []byte{1}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousRelease := func(token string) TokenClass {
+		decoded, err := base64.RawURLEncoding.DecodeString(token)
+		if err != nil || len(decoded) != 32 {
+			return TokenExternal
+		}
+		for _, kind := range []TokenClass{TokenBootstrap, TokenSession} {
+			mac := hmac.New(sha256.New, key[:])
+			_, _ = mac.Write([]byte("tproxy-server-token-v1\x00"))
+			_, _ = mac.Write([]byte{byte(kind)})
+			_, _ = mac.Write(decoded[:16])
+			if hmac.Equal(decoded[16:], mac.Sum(nil)[:16]) {
+				return kind
+			}
+		}
+		return TokenExternal
+	}
+	if previousRelease(bootstrap) != TokenBootstrap || previousRelease(created.Token) != TokenSession {
+		t.Fatal("previous release does not recognize current tokens")
 	}
 }

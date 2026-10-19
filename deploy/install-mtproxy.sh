@@ -54,6 +54,12 @@ if [[ ! -x "$source_directory/objs/bin/mtproto-proxy" ]] ||
 	trap - EXIT
 	rm -rf "$temporary"
 fi
+# install.sh uses umask 077, so the mtproxy user's make would otherwise leave
+# /opt/MTProxy and the binary mode 0700. The unit runs as mtproxy with
+# ProtectSystem=strict and then fails with status 203/EXEC. Normalize on every
+# run: builds from earlier installers pass the check above and are kept.
+find "$source_directory" -type d -exec chmod 0755 {} +
+chmod 0755 "$source_directory/objs/bin/mtproto-proxy"
 
 # Enforce the modes the service user needs on every run. The build guard above
 # skips work whenever the binary exists and is executable, so an installation

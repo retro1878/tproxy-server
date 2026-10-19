@@ -29,18 +29,19 @@ func (s *Server) bridgeProfile(r *http.Request) *config.Profile {
 // headers, malformed queries, cookies, referrers, or wrong-path requests. Bodies
 // and trailers are deliberately not read: public uploads must remain streaming.
 func (s *Server) hasInternalSecret(r *http.Request) bool {
-	if s.config.LegacyTokenDrain && legacyCarrierCredential(r) {
+	scan := secretScan{manager: s.manager}
+	if scan.carrierCredential(r, s.config.LegacyTokenDrain) {
 		return true
 	}
-	if s.containsSecret(r.URL.String()) || s.containsSecret(r.Host) {
+	if scan.contains(r.URL.String()) || scan.contains(r.Host) {
 		return true
 	}
 	for name, values := range r.Header {
-		if s.containsSecret(name) {
+		if scan.contains(name) {
 			return true
 		}
 		for _, value := range values {
-			if s.containsSecret(value) {
+			if scan.contains(value) {
 				return true
 			}
 		}
@@ -48,17 +49,21 @@ func (s *Server) hasInternalSecret(r *http.Request) bool {
 	return false
 }
 
-func legacyCarrierCredential(r *http.Request) bool {
+// carrierCredential looks for a canonical token in the fields where the bridge
+// page sends one: any such token while draining, otherwise a signed one, with
+// or without the filter tag.
+func (scan *secretScan) carrierCredential(r *http.Request, drain bool) bool {
 	for _, value := range r.Header.Values("Authorization") {
-		if _, ok := bearerToken(value); ok {
+		if token, ok := bearerToken(value); ok && (drain || scan.signed(token)) {
 			return true
 		}
 	}
-	for _, value := range r.Header.Values("Sec-WebSocket-Protocol") {
+	// Canonical spelling: Values would allocate to canonicalize it per request.
+	for _, value := range r.Header["Sec-Websocket-Protocol"] {
 		for _, protocol := range strings.Split(value, ",") {
 			token, _, _, ok := webSocketCredentials(strings.TrimSpace(protocol))
 			if ok {
-				if _, ok := bearerToken("Bearer " + token); ok {
+				if _, ok := bearerToken("Bearer " + token); ok && (drain || scan.signed(token)) {
 					return true
 				}
 			}
@@ -67,7 +72,29 @@ func legacyCarrierCredential(r *http.Request) bool {
 	return false
 }
 
-func (s *Server) containsSecret(text string) bool {
+// secretScan checks every 43-character window of every base64 run. Clients
+// choose that metadata before any limit applies, and only an authentic secret
+// may change the response, so a window must not allocate or rekey the MAC.
+type secretScan struct {
+	manager *session.Manager
+	tokens  *session.TokenClassifier
+	decoded []byte
+}
+
+func (scan *secretScan) classifier() *session.TokenClassifier {
+	if scan.tokens == nil {
+		scan.tokens = scan.manager.NewTokenClassifier()
+	}
+	return scan.tokens
+}
+
+func (scan *secretScan) signed(token string) bool {
+	var decoded [32]byte
+	n, err := base64.RawURLEncoding.Decode(decoded[:], []byte(token))
+	return err == nil && n == len(decoded) && scan.classifier().Signed(decoded[:])
+}
+
+func (scan *secretScan) contains(text string) bool {
 	// Decode individual escapes so a malformed escape elsewhere cannot hide a
 	// capability. Do not parse/re-encode the public query: even malformed query
 	// strings belong to the application when they carry no authentic secret.
@@ -90,17 +117,44 @@ func (s *Server) containsSecret(text string) bool {
 		if i < len(text) && base64Byte(text[i]) {
 			continue
 		}
-		for ; start+43 <= i; start++ {
-			candidate := text[start : start+43]
-			if s.manager.ClassifyToken(candidate) != session.TokenExternal {
-				return true
-			}
-			value, err := base64.RawURLEncoding.DecodeString(candidate)
-			if err == nil && s.manager.MatchCapability(value) != nil {
+		if scan.containsInRun(text[start:i]) {
+			return true
+		}
+		start = i + 1
+	}
+	return false
+}
+
+// A window starting at offset phase+4*j decodes to the same 32 bytes as the
+// run decoded from phase, at 3*j: whole quanta map to whole byte triples, and
+// the window's 43rd character contributes only the two bits lenient decoding
+// keeps. So four decodes of the run cover every offset.
+func (scan *secretScan) containsInRun(run string) bool {
+	const windowChars, windowBytes = 43, 32
+	if len(run) < windowChars {
+		return false
+	}
+	tokens := scan.classifier()
+	for phase := 0; phase < 4 && phase+windowChars <= len(run); phase++ {
+		chars := run[phase:]
+		if len(chars)%4 == 1 {
+			chars = chars[:len(chars)-1]
+		}
+		if need := base64.RawURLEncoding.DecodedLen(len(chars)); cap(scan.decoded) < need {
+			scan.decoded = make([]byte, need)
+		}
+		decoded := scan.decoded[:cap(scan.decoded)]
+		n, err := base64.RawURLEncoding.Decode(decoded, []byte(chars))
+		if err != nil {
+			continue
+		}
+		for offset := 0; offset+windowBytes <= n; offset += 3 {
+			value := decoded[offset : offset+windowBytes]
+			if tokens.Classify(value) != session.TokenExternal ||
+				scan.manager.MatchCapability(value) != nil {
 				return true
 			}
 		}
-		start = i + 1
 	}
 	return false
 }

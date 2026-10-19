@@ -1,9 +1,11 @@
 package session
 
 import (
+	"crypto/cipher"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -63,8 +65,14 @@ type Capacity struct {
 }
 
 type Manager struct {
-	config   config.Config
-	tokenKey [sha256.Size]byte
+	config      config.Config
+	tokenKey    [sha256.Size]byte
+	tokenFilter cipher.Block
+	// Capabilities are secret, so their leading bytes are an unpredictable
+	// prefilter: request scanning compares every window against every profile
+	// otherwise. The map hash is seeded per process and compares whole keys, so
+	// a lookup reveals nothing short of a full 8-byte match.
+	capabilityPrefixes map[uint64]struct{}
 
 	mu                   sync.Mutex
 	bootstraps           map[[sha256.Size]byte]*bootstrap
@@ -106,6 +114,8 @@ func NewManager(value config.Config, tokenKey [sha256.Size]byte) *Manager {
 	result := &Manager{
 		config:              value,
 		tokenKey:            tokenKey,
+		tokenFilter:         newTokenFilter(tokenKey),
+		capabilityPrefixes:  make(map[uint64]struct{}, len(value.Profiles)),
 		bootstraps:          make(map[[sha256.Size]byte]*bootstrap),
 		bootstrapsPerIP:     make(map[string]int),
 		sessions:            make(map[[sha256.Size]byte]*Session),
@@ -119,12 +129,22 @@ func NewManager(value config.Config, tokenKey [sha256.Size]byte) *Manager {
 		stop:                make(chan struct{}),
 		done:                make(chan struct{}),
 	}
+	for i := range value.Profiles {
+		result.capabilityPrefixes[capabilityPrefix(value.Profiles[i].Capability[:])] = struct{}{}
+	}
 	go result.cleanupLoop()
 	return result
 }
 
+func capabilityPrefix(value []byte) uint64 {
+	return binary.LittleEndian.Uint64(value)
+}
+
 func (m *Manager) MatchCapability(value []byte) *config.Profile {
 	if len(value) != sha256.Size {
+		return nil
+	}
+	if _, ok := m.capabilityPrefixes[capabilityPrefix(value)]; !ok {
 		return nil
 	}
 	matched := -1
