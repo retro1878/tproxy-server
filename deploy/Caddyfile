@@ -12,14 +12,13 @@
 		# read_body is a hard limit on the whole upload, so setting one caps a
 		# carrier batch that is still arriving on a slow uplink - which is the
 		# case the relay's own progress-resetting body deadline exists to allow.
-		# read_body_idle is the bound that fits: it resets after every successful
-		# read, so a client that keeps sending is not cut, while a stalled upload
-		# still is. It does not stop a client that trickles just enough to never
-		# stall, since the relay's own body deadline resets on progress too; add
-		# a min_rate here if that becomes a problem in practice.
+		# Caddy has no idle-read timeout to express that bound, so the limit is
+		# switched off here and the body is bounded by the relay instead: it caps
+		# the body at limits.max_body_bytes and re-arms a 30s read deadline on
+		# every read, so a stalled upload is cut while a slow one is not.
 		timeouts {
 			read_header 10s
-			read_body_idle 60s
+			read_body 0
 		}
 	}
 }

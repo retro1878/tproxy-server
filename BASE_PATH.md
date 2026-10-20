@@ -311,11 +311,14 @@ example.com {
 }
 ```
 
-Set `servers.timeouts.read_body_idle` as in `deploy/Caddyfile`, and leave
-`read_body` unset. `read_body` is a hard limit on the whole upload rather than an
-inactivity bound, so setting one cuts a carrier batch that is still arriving on a
-slow uplink — the case the relay's own progress-resetting body deadline exists to
-allow. Long polls carry no request body, so their budget is not at risk here.
+Set `servers.timeouts.read_body 0` as in `deploy/Caddyfile`. `read_body` is a hard
+limit on the whole upload rather than an inactivity bound, so any non-zero value
+cuts a carrier batch that is still arriving on a slow uplink — the case the relay's
+own progress-resetting body deadline exists to allow. Caddy has no idle-read
+timeout, so the limit is switched off at this hop and the body is bounded by the
+relay instead, which caps it at `limits.max_body_bytes` and re-arms a read
+deadline on every read. Long polls carry no request body, so their budget is not
+at risk here.
 
 ## 5. Rolling out on a domain you already own
 
